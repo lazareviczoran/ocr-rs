@@ -1,0 +1,21 @@
+[package]
+name = "ocr-rs"
+version = "0.1.0"
+authors = ["Zoran Lazarevic <lazarevic.zoki91@gmail.com>"]
+edition = "2018"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+juice={ version="0.2.5", default-features = false }
+coaster="0.1.1"
+rand="0.7.3"
+magick_rust="0.14.0"
+regex="1"
+lazy_static="1"
+
+[features]
+default = ["native"] # include only the ones you want to use, in this case "native"
+native  = ["juice/native"]
+cuda    = ["juice/cuda"]
+opencl  = ["juice/opencl"]
