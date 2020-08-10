@@ -1,3 +1,5 @@
+use log::info;
+
 use magick_rust::bindings::ColorspaceType_GRAYColorspace;
 use magick_rust::{magick_wand_genesis, MagickWand};
 
@@ -40,10 +42,17 @@ lazy_static! {
 }
 
 pub fn load_values() -> Result<Dataset> {
+    use std::time::Instant;
+    info!("loading values");
+    let instant = Instant::now();
     let train_images = load_values_from_file(TRAIN_IMAGES_FILE)?;
     let train_labels = load_values_from_file(TRAIN_LABELS_FILE)?;
     let test_images = load_values_from_file(TEST_IMAGES_FILE)?;
     let test_labels = load_values_from_file(TEST_LABELS_FILE)?;
+    info!(
+        "Finished loading values in {} ms",
+        instant.elapsed().as_millis()
+    );
 
     Ok(Dataset {
         train_images,
@@ -105,7 +114,7 @@ fn load_images(dir_path: &str) -> Result<Tensor> {
             pixels.append(&mut image_pixels);
         }
     }
-    println!("Creating tensor for images r-{} c-{}", rows, cols);
+    info!("Creating tensor for images r-{} c-{}", rows, cols);
     let images_tensor = Tensor::of_slice(&pixels)
         .view((rows as i64, cols as i64))
         .to_kind(Kind::Float)
@@ -128,7 +137,7 @@ fn load_labels(dir_path: &str) -> Result<Tensor> {
             labels.push(*VALUES_MAP.get(&letter).unwrap());
         }
     }
-    println!("Creating tensor for labels r-{} c-1", rows);
+    info!("Creating tensor for labels r-{} c-1", rows);
     let labels_tensor = Tensor::of_slice(&labels).to_kind(Kind::Int64);
     Ok(labels_tensor)
 }

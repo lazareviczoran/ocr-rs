@@ -1,5 +1,6 @@
 use super::image_ops;
 use anyhow::Result;
+use log::info;
 use tch::{nn, nn::Module, nn::OptimizerConfig, Device};
 
 const IMAGE_DIM: i64 = 784;
@@ -39,7 +40,7 @@ pub fn run() -> Result<()> {
     let test_accuracy = net
       .forward(&m.test_images)
       .accuracy_for_logits(&m.test_labels);
-    println!(
+    info!(
       "epoch: {:4} train loss: {:8.5} test acc: {:5.2}%",
       epoch,
       f64::from(&loss),

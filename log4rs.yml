@@ -1,0 +1,19 @@
+refresh_rate: 30 seconds
+
+appenders:
+  stdout:
+    kind: file
+    # The path of the log file. Required.
+    path: log/ocr-rs.log
+    # Specifies if the appender should append to or truncate the log file if it
+    # already exists. Defaults to `true`.
+    append: true
+    # The encoder to use to format output. Defaults to `kind: pattern`.
+    encoder:
+      kind: pattern
+      pattern: "{d(%Y-%m-%d %H:%M:%S)} {m}{n}"
+
+root:
+  level: trace
+  appenders:
+    - stdout
