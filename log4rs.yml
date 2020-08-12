@@ -2,6 +2,9 @@ refresh_rate: 30 seconds
 
 appenders:
   stdout:
+    kind: console
+
+  filelog:
     kind: file
     # The path of the log file. Required.
     path: log/ocr-rs.log
@@ -17,3 +20,4 @@ root:
   level: trace
   appenders:
     - stdout
+    - filelog
