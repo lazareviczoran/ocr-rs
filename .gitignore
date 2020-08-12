@@ -13,3 +13,4 @@ training_images_data
 training_labels_data
 log/
 Cargo.lock
+**/*.model

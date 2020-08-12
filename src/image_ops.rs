@@ -3,7 +3,8 @@ use log::info;
 use magick_rust::bindings::ColorspaceType_GRAYColorspace;
 use magick_rust::{magick_wand_genesis, MagickWand};
 
-use std::collections::HashMap;
+use super::utils::{VALUES_COUNT, VALUES_MAP};
+
 use std::fs;
 use std::path::Path;
 use std::sync::Once;
@@ -20,23 +21,7 @@ const TEST_LABELS_FILE: &str = "test_labels_data";
 
 static START: Once = Once::new();
 
-pub const VALUES: &str = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
-pub const VALUES_COUNT: usize = VALUES.len();
 lazy_static! {
-    static ref POS_TO_CHAR: HashMap<usize, char> = {
-        let mut m = HashMap::new();
-        for (pos, ch) in VALUES.char_indices() {
-            m.insert(pos, ch);
-        }
-        m
-    };
-    static ref VALUES_MAP: HashMap<char, u8> = {
-        let mut m = HashMap::new();
-        for (pos, ch) in VALUES.char_indices() {
-            m.insert(ch, pos as u8);
-        }
-        m
-    };
     static ref FILE_NAME_FORMAT_REGEX: Regex =
         Regex::new(r"(.*)-(upper|lower|num)-([a-zA-z0-9])-img\.png").unwrap();
 }
@@ -61,6 +46,19 @@ pub fn load_values() -> Result<Dataset> {
         test_labels,
         labels: VALUES_COUNT as i64,
     })
+}
+
+pub fn load_image_as_tensor(file_path: &str) -> Result<Tensor> {
+    if !Path::new(file_path).exists() {
+        return Err(anyhow!("File {} doesn't exist", file_path));
+    }
+    let image_pixels = get_image_pixel_colors_grayscale(file_path)?;
+
+    let images_tensor = Tensor::of_slice(&image_pixels)
+        .view((1, image_pixels.len() as i64))
+        .to_kind(Kind::Float)
+        / 255.;
+    Ok(images_tensor)
 }
 
 fn load_values_from_file(file_path: &str) -> Result<Tensor> {
