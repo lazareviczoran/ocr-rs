@@ -73,12 +73,13 @@ pub fn run_prediction(image_tensor: &Tensor) -> Result<()> {
   // recognize character
   let instant = Instant::now();
   let res = net.forward(&image_tensor).softmax(-1, Kind::Float);
-  let predicted_value = utils::topk(&res, 1)[0].0;
+  let (predicted_value, probability) = utils::topk(&res, 1)[0];
 
   debug!(
-    "finished classification in {:?} ns, with {} as result",
+    "finished classification in {:?} ns, with {} as result with {:3.2}% of certainty",
     instant.elapsed().as_nanos(),
-    predicted_value
+    predicted_value,
+    probability * 100.
   );
 
   Ok(())
