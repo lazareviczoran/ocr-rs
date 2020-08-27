@@ -1,22 +1,22 @@
 use log::info;
 
 use super::utils::{VALUES_COUNT, VALUES_MAP};
-
+use anyhow::{anyhow, Result};
+use image::{imageops::FilterType, open, DynamicImage};
+use log::debug;
+use rayon::prelude::*;
+use regex::Regex;
 use std::fs;
 use std::path::Path;
-
-use anyhow::{anyhow, Result};
-use regex::Regex;
+use std::time::Instant;
 use tch::vision::dataset::Dataset;
 use tch::{Kind, Tensor};
-
-use image::{open, DynamicImage};
-use rayon::prelude::*;
 
 const TRAIN_IMAGES_FILE: &str = "training_images_data";
 const TRAIN_LABELS_FILE: &str = "training_labels_data";
 const TEST_IMAGES_FILE: &str = "test_images_data";
 const TEST_LABELS_FILE: &str = "test_labels_data";
+const TEXT_DETECTION_IMAGE_SIZE: u32 = 800;
 
 lazy_static! {
     static ref FILE_NAME_FORMAT_REGEX: Regex =
@@ -24,7 +24,6 @@ lazy_static! {
 }
 
 pub fn load_values() -> Result<Dataset> {
-    use std::time::Instant;
     info!("loading values");
     let instant = Instant::now();
     let train_images = load_values_from_file(TRAIN_IMAGES_FILE)?;
@@ -175,4 +174,29 @@ fn get_image_pixel_colors_grayscale(file_path: &str) -> Result<Vec<u8>> {
         }
     }
     Ok(pixels)
+}
+
+pub fn preprocess_image(file_path: &str) -> Result<(DynamicImage, f64, f64)> {
+    let instant = Instant::now();
+    let rgba_image = open(file_path)?.into_rgba();
+    let mut dyn_image_800x800 = DynamicImage::new_luma8(800, 800);
+    let dyn_image = DynamicImage::ImageRgba8(rgba_image)
+        .resize(800, 800, FilterType::Triangle)
+        .to_luma();
+
+    // correction for pixel coords
+    let adjust_x = dyn_image.width() as f64 / TEXT_DETECTION_IMAGE_SIZE as f64;
+    let adjust_y = dyn_image.height() as f64 / TEXT_DETECTION_IMAGE_SIZE as f64;
+
+    for (x, y, p) in dyn_image.enumerate_pixels() {
+        *dyn_image_800x800
+            .as_mut_luma8()
+            .unwrap()
+            .get_pixel_mut(x, y) = *p;
+    }
+    debug!(
+        "finished preprocessing in {} ns",
+        instant.elapsed().as_nanos()
+    );
+    Ok((dyn_image_800x800, adjust_x, adjust_y))
 }
