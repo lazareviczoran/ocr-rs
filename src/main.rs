@@ -12,7 +12,7 @@ mod utils;
 use anyhow::Result;
 
 fn main() -> Result<()> {
-    log4rs::init_file("log4rs.yml", Default::default()).unwrap();
+    log4rs::init_file("log4rs.yml", Default::default())?;
 
     let image_tensor =
         image_ops::load_image_as_tensor("images/test/akronim-dist-1-regular-upper-M-img.png")?;

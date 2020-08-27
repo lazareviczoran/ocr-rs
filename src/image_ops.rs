@@ -11,6 +11,7 @@ use tch::vision::dataset::Dataset;
 use tch::{Kind, Tensor};
 
 use image::{open, DynamicImage};
+use rayon::prelude::*;
 
 const TRAIN_IMAGES_FILE: &str = "training_images_data";
 const TRAIN_LABELS_FILE: &str = "training_labels_data";
@@ -90,56 +91,84 @@ fn load_values_from_file(file_path: &str) -> Result<Tensor> {
 }
 
 fn load_images(dir_path: &str) -> Result<Tensor> {
-    let files = fs::read_dir(dir_path).unwrap();
-    let mut pixels = Vec::new();
-    let mut cols = 0;
-    let mut rows = 0;
-    for file in files {
-        let file_info = file.unwrap();
-        let filename = file_info.file_name();
-        if FILE_NAME_FORMAT_REGEX
-            .captures(filename.to_str().unwrap())
-            .is_some()
-        {
-            rows += 1;
-            let mut image_pixels =
-                get_image_pixel_colors_grayscale(&file_info.path().display().to_string())?;
-            cols = image_pixels.len();
-            pixels.append(&mut image_pixels);
-        }
+    if let Ok(files) = fs::read_dir(dir_path) {
+        let files_info: Vec<std::fs::DirEntry> = files.map(|f| f.unwrap()).collect();
+        let (pixels, rows, cols) = files_info
+            .par_iter()
+            .fold(
+                || (Vec::new(), 0, 0),
+                |(mut p_vec, mut rows, mut cols), file| {
+                    let filename = file.file_name();
+                    if FILE_NAME_FORMAT_REGEX
+                        .captures(filename.to_str().unwrap())
+                        .is_some()
+                    {
+                        rows += 1;
+                        let mut image_pixels =
+                            get_image_pixel_colors_grayscale(&file.path().display().to_string())
+                                .unwrap();
+                        cols = image_pixels.len();
+                        p_vec.append(&mut image_pixels);
+                    }
+                    (p_vec, rows, cols)
+                },
+            )
+            .reduce(
+                || (Vec::new(), 0, 0),
+                |(mut acc_vec, total_rows, _), (mut partial, p_rows, p_cols)| {
+                    acc_vec.append(&mut partial);
+                    (acc_vec, total_rows + p_rows, p_cols)
+                },
+            );
+        info!("Creating tensor for images r-{} c-{}", rows, cols);
+        let images_tensor = Tensor::of_slice(&pixels)
+            .view((rows as i64, cols as i64))
+            .to_kind(Kind::Float)
+            / 255.;
+        return Ok(images_tensor);
     }
-    info!("Creating tensor for images r-{} c-{}", rows, cols);
-    let images_tensor = Tensor::of_slice(&pixels)
-        .view((rows as i64, cols as i64))
-        .to_kind(Kind::Float)
-        / 255.;
-    Ok(images_tensor)
+    Err(anyhow!("Could not open dir {}", dir_path))
 }
 
 fn load_labels(dir_path: &str) -> Result<Tensor> {
-    let files = fs::read_dir(dir_path).unwrap();
-    let mut labels = Vec::new();
-    let mut rows = 0;
-    for file in files {
-        let file_info = file.unwrap();
-        let filename = file_info.file_name();
-        if let Some(caps) = FILE_NAME_FORMAT_REGEX.captures(filename.to_str().unwrap()) {
-            rows += 1;
-            let _font = String::from(&caps[1]);
-            let _letter_type = String::from(&caps[2]);
-            let letter = caps[3].chars().next().unwrap();
-            labels.push(*VALUES_MAP.get(&letter).unwrap());
-        }
+    if let Ok(files) = fs::read_dir(dir_path) {
+        let filenames: Vec<String> = files
+            .map(|f| f.unwrap().file_name().into_string().unwrap())
+            .collect();
+        let (labels, rows, _cols) = filenames
+            .par_iter()
+            .fold(
+                || (Vec::new(), 0, 0),
+                |(mut p_vec, mut rows, _), filename| {
+                    if let Some(caps) = FILE_NAME_FORMAT_REGEX.captures(filename) {
+                        rows += 1;
+                        let _font = String::from(&caps[1]);
+                        let _letter_type = String::from(&caps[2]);
+                        if let Some(letter) = caps[3].chars().next() {
+                            p_vec.push(*VALUES_MAP.get(&letter).unwrap());
+                        }
+                    }
+                    (p_vec, rows, 1)
+                },
+            )
+            .reduce(
+                || (Vec::new(), 0, 0),
+                |(mut acc_vec, total_rows, _), (mut partial, p_rows, p_cols)| {
+                    acc_vec.append(&mut partial);
+                    (acc_vec, total_rows + p_rows, p_cols)
+                },
+            );
+        info!("Creating tensor for labels r-{} c-1", rows);
+        let labels_tensor = Tensor::of_slice(&labels).to_kind(Kind::Int64);
+        return Ok(labels_tensor);
     }
-    info!("Creating tensor for labels r-{} c-1", rows);
-    let labels_tensor = Tensor::of_slice(&labels).to_kind(Kind::Int64);
-    Ok(labels_tensor)
+    Err(anyhow!("Could not open dir {}", dir_path))
 }
 
 fn get_image_pixel_colors_grayscale(file_path: &str) -> Result<Vec<u8>> {
     let mut pixels = Vec::new();
-    let rgb_image = open(file_path).unwrap().into_rgb();
-    let gray_image = DynamicImage::ImageRgb8(rgb_image).into_luma();
+    let rgba_image = open(file_path)?.into_rgba();
+    let gray_image = DynamicImage::ImageRgba8(rgba_image).into_luma();
     for i in 0..gray_image.height() {
         for j in 0..gray_image.width() {
             pixels.push(gray_image.get_pixel(i, j).0[0]);
