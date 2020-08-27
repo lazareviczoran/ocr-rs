@@ -1,25 +1,21 @@
 use log::info;
 
-use magick_rust::bindings::ColorspaceType_GRAYColorspace;
-use magick_rust::{magick_wand_genesis, MagickWand};
-
 use super::utils::{VALUES_COUNT, VALUES_MAP};
 
 use std::fs;
 use std::path::Path;
-use std::sync::Once;
 
 use anyhow::{anyhow, Result};
 use regex::Regex;
 use tch::vision::dataset::Dataset;
 use tch::{Kind, Tensor};
 
+use image::{open, DynamicImage};
+
 const TRAIN_IMAGES_FILE: &str = "training_images_data";
 const TRAIN_LABELS_FILE: &str = "training_labels_data";
 const TEST_IMAGES_FILE: &str = "test_images_data";
 const TEST_LABELS_FILE: &str = "test_labels_data";
-
-static START: Once = Once::new();
 
 lazy_static! {
     static ref FILE_NAME_FORMAT_REGEX: Regex =
@@ -141,43 +137,12 @@ fn load_labels(dir_path: &str) -> Result<Tensor> {
 }
 
 fn get_image_pixel_colors_grayscale(file_path: &str) -> Result<Vec<u8>> {
-    START.call_once(|| {
-        magick_wand_genesis();
-    });
     let mut pixels = Vec::new();
-    let wand = MagickWand::new();
-    wand.read_image(file_path)
-        .map_err(|err| anyhow!("Failed to read image {}: {}", file_path, err))?;
-    wand.transform_image_colorspace(ColorspaceType_GRAYColorspace)
-        .map_err(|err| anyhow!("Failed to convert to gray in image {}: {}", file_path, err))?;
-    let cols = wand.get_image_width();
-    let rows = wand.get_image_height();
-    for i in 0..rows {
-        for j in 0..cols {
-            // convert to grayscale and store value
-            if let Some(pixel_info) = wand.get_image_pixel_color(i as isize, j as isize) {
-                let color_values = pixel_info.get_color_as_string().map_err(|err| {
-                    anyhow!(
-                        "Failed to read pixel {:?} color in file {}: {}",
-                        (i, j),
-                        file_path,
-                        err
-                    )
-                })?;
-                let values_vec: Vec<&str> = color_values
-                    .get(5..color_values.len() - 1)
-                    .unwrap()
-                    .split_terminator(',')
-                    .collect();
-                pixels.push(values_vec[0].parse::<u8>().unwrap());
-            } else {
-                return Err(anyhow!(
-                    "Couldn't get data for pixel ({}:{}) in {}",
-                    i,
-                    j,
-                    file_path
-                ));
-            }
+    let rgb_image = open(file_path).unwrap().into_rgb();
+    let gray_image = DynamicImage::ImageRgb8(rgb_image).into_luma();
+    for i in 0..gray_image.height() {
+        for j in 0..gray_image.width() {
+            pixels.push(gray_image.get_pixel(i, j).0[0]);
         }
     }
     Ok(pixels)
