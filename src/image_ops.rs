@@ -2,11 +2,14 @@ use log::info;
 
 use super::utils::{VALUES_COUNT, VALUES_MAP};
 use anyhow::{anyhow, Result};
-use image::{imageops::FilterType, open, DynamicImage};
+use image::{imageops::FilterType, open, DynamicImage, GrayImage, Luma};
+use imageproc::definitions::Image;
+use imageproc::drawing::{self, Point};
 use log::debug;
 use rayon::prelude::*;
 use regex::Regex;
-use std::fs;
+use std::fs::{self, File};
+use std::io::prelude::*;
 use std::path::Path;
 use std::time::Instant;
 use tch::vision::dataset::Dataset;
@@ -16,7 +19,10 @@ const TRAIN_IMAGES_FILE: &str = "training_images_data";
 const TRAIN_LABELS_FILE: &str = "training_labels_data";
 const TEST_IMAGES_FILE: &str = "test_images_data";
 const TEST_LABELS_FILE: &str = "test_labels_data";
-const TEXT_DETECTION_IMAGE_SIZE: u32 = 800;
+const DEFAULT_WIDTH: u32 = 800;
+const DEFAULT_HEIGHT: u32 = 800;
+const WHITE_COLOR: Luma<u8> = Luma([255]);
+const BLACK_COLOR: Luma<u8> = Luma([0]);
 
 lazy_static! {
     static ref FILE_NAME_FORMAT_REGEX: Regex =
@@ -179,14 +185,16 @@ fn get_image_pixel_colors_grayscale(file_path: &str) -> Result<Vec<u8>> {
 pub fn preprocess_image(file_path: &str) -> Result<(DynamicImage, f64, f64)> {
     let instant = Instant::now();
     let rgba_image = open(file_path)?.into_rgba();
-    let mut dyn_image_800x800 = DynamicImage::new_luma8(800, 800);
+    let original_width = rgba_image.width();
+    let original_height = rgba_image.height();
     let dyn_image = DynamicImage::ImageRgba8(rgba_image)
         .resize(800, 800, FilterType::Triangle)
         .to_luma();
+    let mut dyn_image_800x800 = DynamicImage::new_luma8(800, 800);
 
     // correction for pixel coords
-    let adjust_x = dyn_image.width() as f64 / TEXT_DETECTION_IMAGE_SIZE as f64;
-    let adjust_y = dyn_image.height() as f64 / TEXT_DETECTION_IMAGE_SIZE as f64;
+    let adjust_x = dyn_image.width() as f64 / original_width as f64;
+    let adjust_y = dyn_image.height() as f64 / original_height as f64;
 
     for (x, y, p) in dyn_image.enumerate_pixels() {
         *dyn_image_800x800
@@ -199,4 +207,84 @@ pub fn preprocess_image(file_path: &str) -> Result<(DynamicImage, f64, f64)> {
         instant.elapsed().as_nanos()
     );
     Ok((dyn_image_800x800, adjust_x, adjust_y))
+}
+
+fn generate_gt_and_mask_images(
+    polygons: &[Tensor],
+    adjust_x: f64,
+    adjust_y: f64,
+) -> Result<(Image<Luma<u8>>, Image<Luma<u8>>)> {
+    let mut gt_image = GrayImage::new(DEFAULT_WIDTH, DEFAULT_HEIGHT);
+    let mut mask_temp = DynamicImage::new_luma8(DEFAULT_WIDTH, DEFAULT_HEIGHT);
+    mask_temp.invert();
+    let mut mask_image = mask_temp.to_luma();
+    for poly in polygons {
+        let (num_of_points, _) = poly.size2()?;
+        let poly_values = (0..num_of_points)
+            .map(|i| {
+                Point::new(
+                    (poly.double_value(&[i, 0]) * adjust_x) as i32,
+                    (poly.double_value(&[i, 1]) * adjust_y) as i32,
+                )
+            })
+            .collect::<Vec<Point<i32>>>();
+        drawing::draw_convex_polygon_mut(&mut gt_image, &poly_values, WHITE_COLOR);
+        drawing::draw_convex_polygon_mut(&mut mask_image, &poly_values, BLACK_COLOR);
+    }
+    Ok((gt_image, mask_image))
+}
+
+fn load_polygons(file_path: &str) -> Result<Vec<Tensor>> {
+    let polygons;
+    if let Ok(mut file) = File::open(file_path) {
+        let mut content = String::new();
+        file.read_to_string(&mut content)?;
+        polygons = content
+            .split_terminator('\n')
+            .map(|row| {
+                // row is in format
+                // x1,y1,x2,y2,...,x{n},y{n},{FOUND TEXT}
+                // where n is number of points in the polygon (not a fixed value)
+
+                let values = row
+                    .split_terminator(',')
+                    .filter_map(|v| {
+                        if let Ok(value_i32) = v.parse::<i32>() {
+                            Some(value_i32)
+                        } else {
+                            // ignore the text
+                            None
+                        }
+                    })
+                    .collect::<Vec<i32>>();
+                Tensor::of_slice(&values).view((-1, 2))
+            })
+            .collect();
+    } else {
+        return Err(anyhow!("didn't find file {}", file_path));
+    }
+
+    Ok(polygons)
+}
+
+pub fn load_text_detection_image(file_path: &str) -> Result<()> {
+    let instant = Instant::now();
+    let (preprocessed_image, adjust_x, adjust_y) = preprocess_image(file_path)?;
+
+    let path_parts = file_path.split_terminator('/').collect::<Vec<&str>>();
+    let last_idx = path_parts.len() - 1;
+    let polygons = load_polygons(&format!(
+        "text-detection-images/totaltext/gts/{}/{}.txt",
+        path_parts[last_idx - 1],
+        path_parts[last_idx]
+    ))?;
+
+    let (gt_image, mask_image) = generate_gt_and_mask_images(&polygons, adjust_x, adjust_y)?;
+
+    debug!(
+        "finished loading and preparing text detection images in {:?} ns",
+        instant.elapsed().as_nanos()
+    );
+
+    Ok(())
 }

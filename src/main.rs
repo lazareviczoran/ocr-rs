@@ -60,7 +60,10 @@ fn main() -> Result<()> {
     // } else if let Some(matches) = matches.subcommand_matches(TEXT_DETECTION_SC) {
     //
     } else if let Some(_matches) = matches.subcommand_matches(IMAGE_OPS_SC) {
-        image_ops::preprocess_image("Screen Shot 2020-08-27 at 5.37.59 PM.png")?;
+        // image_ops::preprocess_image("Screen Shot 2020-08-27 at 5.37.59 PM.png")?;
+        image_ops::load_text_detection_image(
+            "text-detection-images/totaltext/images/test/img1.jpg",
+        )?;
     }
 
     Ok(())
