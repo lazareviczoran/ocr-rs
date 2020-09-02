@@ -1,8 +1,10 @@
 /target/
 **/*.rs.bk
 /images/*
+/text-detection-images/*
 **/.DS_Store
 test_images_data
 test_labels_data
 training_images_data
 training_labels_data
+/log/*

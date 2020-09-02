@@ -424,8 +424,7 @@ dependencies = [
 [[package]]
 name = "imageproc"
 version = "0.21.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7b0fbd0ced24e3bc65052406fa6466203fe9c8d1990a3327567433e47109ed1a"
+source = "git+https://github.com/lazareviczoran/imageproc?branch=zl-draw-polygon-improvements#e1d8d678beea9fd849f913fe7e4a68c5181edb62"
 dependencies = [
  "conv",
  "image",
