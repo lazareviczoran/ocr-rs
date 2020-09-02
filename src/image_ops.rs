@@ -2,8 +2,7 @@ use log::info;
 
 use super::utils::{VALUES_COUNT, VALUES_MAP};
 use anyhow::{anyhow, Result};
-use image::{imageops::FilterType, open, DynamicImage, GrayImage, Luma};
-use imageproc::definitions::Image;
+use image::{imageops::FilterType, open, DynamicImage, GrayImage, ImageBuffer, Luma};
 use imageproc::drawing::{self, Point};
 use log::debug;
 use rayon::prelude::*;
@@ -13,7 +12,7 @@ use std::io::prelude::*;
 use std::path::Path;
 use std::time::Instant;
 use tch::vision::dataset::Dataset;
-use tch::{Kind, Tensor};
+use tch::{IndexOp, Kind, Tensor};
 
 const TRAIN_IMAGES_FILE: &str = "training_images_data";
 const TRAIN_LABELS_FILE: &str = "training_labels_data";
@@ -23,6 +22,7 @@ const DEFAULT_WIDTH: u32 = 800;
 const DEFAULT_HEIGHT: u32 = 800;
 const WHITE_COLOR: Luma<u8> = Luma([255]);
 const BLACK_COLOR: Luma<u8> = Luma([0]);
+const MIN_TEXT_SIZE: i32 = 8;
 
 lazy_static! {
     static ref FILE_NAME_FORMAT_REGEX: Regex =
@@ -171,14 +171,14 @@ fn load_labels(dir_path: &str) -> Result<Tensor> {
 }
 
 fn get_image_pixel_colors_grayscale(file_path: &str) -> Result<Vec<u8>> {
-    let mut pixels = Vec::new();
     let rgba_image = open(file_path)?.into_rgba();
     let gray_image = DynamicImage::ImageRgba8(rgba_image).into_luma();
-    for i in 0..gray_image.height() {
-        for j in 0..gray_image.width() {
-            pixels.push(gray_image.get_pixel(i, j).0[0]);
-        }
-    }
+    let mut pixels = vec![0; (gray_image.width() * gray_image.height()) as usize];
+    pixels.par_iter_mut().enumerate().for_each(|(n, val)| {
+        let y = n as u32 / gray_image.width();
+        let x = n as u32 - y * gray_image.width();
+        *val = gray_image.get_pixel(x, y).0[0];
+    });
     Ok(pixels)
 }
 
@@ -188,38 +188,51 @@ pub fn preprocess_image(file_path: &str) -> Result<(DynamicImage, f64, f64)> {
     let original_width = rgba_image.width();
     let original_height = rgba_image.height();
     let dyn_image = DynamicImage::ImageRgba8(rgba_image)
-        .resize(800, 800, FilterType::Triangle)
+        .resize(DEFAULT_WIDTH, DEFAULT_HEIGHT, FilterType::Triangle)
         .to_luma();
-    let mut dyn_image_800x800 = DynamicImage::new_luma8(800, 800);
 
     // correction for pixel coords
     let adjust_x = dyn_image.width() as f64 / original_width as f64;
     let adjust_y = dyn_image.height() as f64 / original_height as f64;
 
-    for (x, y, p) in dyn_image.enumerate_pixels() {
-        *dyn_image_800x800
-            .as_mut_luma8()
-            .unwrap()
-            .get_pixel_mut(x, y) = *p;
-    }
+    let mut pixel_values = vec![0; (DEFAULT_WIDTH * DEFAULT_HEIGHT) as usize];
+    pixel_values
+        .par_iter_mut()
+        .enumerate()
+        .for_each(|(n, val)| {
+            let y = n as u32 / DEFAULT_WIDTH;
+            let x = n as u32 - y * DEFAULT_WIDTH;
+            if x < dyn_image.width() && y < dyn_image.height() {
+                *val = dyn_image.get_pixel(x, y).0[0];
+            }
+        });
     debug!(
         "finished preprocessing in {} ns",
         instant.elapsed().as_nanos()
     );
-    Ok((dyn_image_800x800, adjust_x, adjust_y))
+    Ok((
+        DynamicImage::ImageLuma8(
+            ImageBuffer::from_vec(DEFAULT_WIDTH, DEFAULT_HEIGHT, pixel_values).unwrap(),
+        ),
+        adjust_x,
+        adjust_y,
+    ))
 }
 
 fn generate_gt_and_mask_images(
     polygons: &[Tensor],
     adjust_x: f64,
     adjust_y: f64,
-) -> Result<(Image<Luma<u8>>, Image<Luma<u8>>)> {
+) -> Result<(GrayImage, GrayImage, Vec<bool>)> {
     let mut gt_image = GrayImage::new(DEFAULT_WIDTH, DEFAULT_HEIGHT);
     let mut mask_temp = DynamicImage::new_luma8(DEFAULT_WIDTH, DEFAULT_HEIGHT);
+    let mut ignore_flags = vec![false; polygons.len()];
     mask_temp.invert();
     let mut mask_image = mask_temp.to_luma();
-    for poly in polygons {
+    for (pos, poly) in polygons.iter().enumerate() {
         let (num_of_points, _) = poly.size2()?;
+        let poly_width = (poly.i((.., 0)).max() - poly.i((.., 0)).min()).int64_value(&[]) as i32;
+        let poly_height = (poly.i((.., 1)).max() - poly.i((.., 1)).min()).int64_value(&[]) as i32;
         let poly_values = (0..num_of_points)
             .map(|i| {
                 Point::new(
@@ -228,10 +241,14 @@ fn generate_gt_and_mask_images(
                 )
             })
             .collect::<Vec<Point<i32>>>();
-        drawing::draw_convex_polygon_mut(&mut gt_image, &poly_values, WHITE_COLOR);
-        drawing::draw_convex_polygon_mut(&mut mask_image, &poly_values, BLACK_COLOR);
+        if poly_height.min(poly_width) < MIN_TEXT_SIZE {
+            drawing::draw_polygon_mut(&mut mask_image, &poly_values, BLACK_COLOR);
+            ignore_flags[pos] = true;
+        } else {
+            drawing::draw_polygon_mut(&mut gt_image, &poly_values, WHITE_COLOR);
+        }
     }
-    Ok((gt_image, mask_image))
+    Ok((gt_image, mask_image, ignore_flags))
 }
 
 fn load_polygons(file_path: &str) -> Result<Vec<Tensor>> {
@@ -279,7 +296,8 @@ pub fn load_text_detection_image(file_path: &str) -> Result<()> {
         path_parts[last_idx]
     ))?;
 
-    let (gt_image, mask_image) = generate_gt_and_mask_images(&polygons, adjust_x, adjust_y)?;
+    let (gt_image, mask_image, ignore_flags) =
+        generate_gt_and_mask_images(&polygons, adjust_x, adjust_y)?;
 
     debug!(
         "finished loading and preparing text detection images in {:?} ns",
