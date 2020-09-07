@@ -7,7 +7,10 @@ extern crate tch;
 
 mod char_rec_conv_nn;
 mod char_rec_nn;
+mod dataset;
 mod image_ops;
+mod text_detection;
+mod text_detection_model;
 mod utils;
 
 use anyhow::Result;
@@ -61,9 +64,9 @@ fn main() -> Result<()> {
     //
     } else if let Some(_matches) = matches.subcommand_matches(IMAGE_OPS_SC) {
         // image_ops::preprocess_image("Screen Shot 2020-08-27 at 5.37.59 PM.png")?;
-        image_ops::load_text_detection_image(
-            "text-detection-images/totaltext/images/test/img1.jpg",
-        )?;
+        // image_ops::load_text_detection_images()?;
+        image_ops::generate_text_det_tensor_chunks(image_ops::TEXT_DET_IMAGES_PATH, true)?;
+        image_ops::generate_text_det_tensor_chunks(image_ops::TEXT_DET_IMAGES_PATH, false)?;
     }
 
     Ok(())

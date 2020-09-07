@@ -15,3 +15,9 @@ log/
 Cargo.lock
 **/*.model
 text-detection-images/
+test_images_data_text_det.*
+test_gt_data_text_det.*
+test_mask_data_text_det.*
+training_images_data_text_det.*
+training_gt_data_text_det.*
+training_mask_data_text_det.*

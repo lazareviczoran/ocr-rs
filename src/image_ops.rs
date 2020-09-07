@@ -1,10 +1,9 @@
-use log::info;
-
+use super::dataset::TextDetectionDataset;
 use super::utils::{VALUES_COUNT, VALUES_MAP};
 use anyhow::{anyhow, Result};
 use image::{imageops::FilterType, open, DynamicImage, GrayImage, ImageBuffer, Luma};
 use imageproc::drawing::{self, Point};
-use log::debug;
+use log::{debug, error, trace};
 use rayon::prelude::*;
 use regex::Regex;
 use std::fs::{self, File};
@@ -14,10 +13,18 @@ use std::time::Instant;
 use tch::vision::dataset::Dataset;
 use tch::{IndexOp, Kind, Tensor};
 
-const TRAIN_IMAGES_FILE: &str = "training_images_data";
-const TRAIN_LABELS_FILE: &str = "training_labels_data";
-const TEST_IMAGES_FILE: &str = "test_images_data";
-const TEST_LABELS_FILE: &str = "test_labels_data";
+const CHAR_REC_IMAGES_PATH: &str = "images";
+const CHAR_REC_TRAIN_IMAGES_FILE: &str = "training_images_data_char";
+const CHAR_REC_TRAIN_LABELS_FILE: &str = "training_labels_data_char";
+const CHAR_REC_TEST_IMAGES_FILE: &str = "test_images_data_char";
+const CHAR_REC_TEST_LABELS_FILE: &str = "test_labels_data_char";
+pub const TEXT_DET_IMAGES_PATH: &str = "text-detection-images/totaltext";
+pub const TEXT_DET_TRAIN_IMAGES_FILE: &str = "training_images_data_text_det";
+pub const TEXT_DET_TRAIN_GT_FILE: &str = "training_gt_data_text_det";
+pub const TEXT_DET_TRAIN_MASK_FILE: &str = "training_mask_data_text_det";
+pub const TEXT_DET_TEST_IMAGES_FILE: &str = "test_images_data_text_det";
+pub const TEXT_DET_TEST_GT_FILE: &str = "test_gt_data_text_det";
+pub const TEXT_DET_TEST_MASK_FILE: &str = "test_mask_data_text_det";
 const DEFAULT_WIDTH: u32 = 800;
 const DEFAULT_HEIGHT: u32 = 800;
 const WHITE_COLOR: Luma<u8> = Luma([255]);
@@ -25,18 +32,19 @@ const BLACK_COLOR: Luma<u8> = Luma([0]);
 const MIN_TEXT_SIZE: i32 = 8;
 
 lazy_static! {
-    static ref FILE_NAME_FORMAT_REGEX: Regex =
+    static ref CHAR_REC_FILE_NAME_FORMAT_REGEX: Regex =
         Regex::new(r"(.*)-(upper|lower|num)-([a-zA-z0-9])-img\.png").unwrap();
+    static ref TEXT_DET_FILE_NAME_FORMAT_REGEX: Regex = Regex::new(r"img[0-9]+\.jpg").unwrap();
 }
 
 pub fn load_values() -> Result<Dataset> {
-    info!("loading values");
+    trace!("loading character recognition values");
     let instant = Instant::now();
-    let train_images = load_values_from_file(TRAIN_IMAGES_FILE)?;
-    let train_labels = load_values_from_file(TRAIN_LABELS_FILE)?;
-    let test_images = load_values_from_file(TEST_IMAGES_FILE)?;
-    let test_labels = load_values_from_file(TEST_LABELS_FILE)?;
-    info!(
+    let train_images = load_values_from_file(CHAR_REC_TRAIN_IMAGES_FILE)?;
+    let train_labels = load_values_from_file(CHAR_REC_TRAIN_LABELS_FILE)?;
+    let test_images = load_values_from_file(CHAR_REC_TEST_IMAGES_FILE)?;
+    let test_labels = load_values_from_file(CHAR_REC_TEST_LABELS_FILE)?;
+    trace!(
         "Finished loading values in {} ms",
         instant.elapsed().as_millis()
     );
@@ -71,22 +79,23 @@ fn load_values_from_file(file_path: &str) -> Result<Tensor> {
         let images_path;
         let labels_path;
         let images_dir;
-        let is_images = file_path == TEST_IMAGES_FILE || file_path == TRAIN_IMAGES_FILE;
-        if file_path == TEST_IMAGES_FILE || file_path == TEST_LABELS_FILE {
-            images_path = TEST_IMAGES_FILE;
-            labels_path = TEST_LABELS_FILE;
-            images_dir = "images/test";
+        let is_images =
+            file_path == CHAR_REC_TEST_IMAGES_FILE || file_path == CHAR_REC_TRAIN_IMAGES_FILE;
+        if file_path == CHAR_REC_TEST_IMAGES_FILE || file_path == CHAR_REC_TEST_LABELS_FILE {
+            images_path = CHAR_REC_TEST_IMAGES_FILE;
+            labels_path = CHAR_REC_TEST_LABELS_FILE;
+            images_dir = format!("{}/test", CHAR_REC_IMAGES_PATH);
         } else {
-            images_path = TRAIN_IMAGES_FILE;
-            labels_path = TRAIN_LABELS_FILE;
-            images_dir = "images/training";
+            images_path = CHAR_REC_TRAIN_IMAGES_FILE;
+            labels_path = CHAR_REC_TRAIN_LABELS_FILE;
+            images_dir = format!("{}/training", CHAR_REC_IMAGES_PATH);
         }
         if is_images {
-            let images_data = load_images(images_dir)?;
+            let images_data = load_images(&images_dir)?;
             images_data.save(images_path)?;
             data_tensor = images_data;
         } else {
-            let labels_data = load_labels(images_dir)?;
+            let labels_data = load_labels(&images_dir)?;
             labels_data.save(labels_path)?;
             data_tensor = labels_data;
         }
@@ -104,7 +113,7 @@ fn load_images(dir_path: &str) -> Result<Tensor> {
                 || (Vec::new(), 0, 0),
                 |(mut p_vec, mut rows, mut cols), file| {
                     let filename = file.file_name();
-                    if FILE_NAME_FORMAT_REGEX
+                    if CHAR_REC_FILE_NAME_FORMAT_REGEX
                         .captures(filename.to_str().unwrap())
                         .is_some()
                     {
@@ -125,7 +134,7 @@ fn load_images(dir_path: &str) -> Result<Tensor> {
                     (acc_vec, total_rows + p_rows, p_cols)
                 },
             );
-        info!("Creating tensor for images r-{} c-{}", rows, cols);
+        trace!("Creating tensor for images r-{} c-{}", rows, cols);
         let images_tensor = Tensor::of_slice(&pixels)
             .view((rows as i64, cols as i64))
             .to_kind(Kind::Float)
@@ -145,7 +154,7 @@ fn load_labels(dir_path: &str) -> Result<Tensor> {
             .fold(
                 || (Vec::new(), 0, 0),
                 |(mut p_vec, mut rows, _), filename| {
-                    if let Some(caps) = FILE_NAME_FORMAT_REGEX.captures(filename) {
+                    if let Some(caps) = CHAR_REC_FILE_NAME_FORMAT_REGEX.captures(filename) {
                         rows += 1;
                         let _font = String::from(&caps[1]);
                         let _letter_type = String::from(&caps[2]);
@@ -163,7 +172,7 @@ fn load_labels(dir_path: &str) -> Result<Tensor> {
                     (acc_vec, total_rows + p_rows, p_cols)
                 },
             );
-        info!("Creating tensor for labels r-{} c-1", rows);
+        trace!("Creating tensor for labels r-{} c-1", rows);
         let labels_tensor = Tensor::of_slice(&labels).to_kind(Kind::Int64);
         return Ok(labels_tensor);
     }
@@ -182,7 +191,7 @@ fn get_image_pixel_colors_grayscale(file_path: &str) -> Result<Vec<u8>> {
     Ok(pixels)
 }
 
-pub fn preprocess_image(file_path: &str) -> Result<(DynamicImage, f64, f64)> {
+pub fn preprocess_image(file_path: &str) -> Result<(GrayImage, f64, f64)> {
     let instant = Instant::now();
     let rgba_image = open(file_path)?.into_rgba();
     let original_width = rgba_image.width();
@@ -206,14 +215,12 @@ pub fn preprocess_image(file_path: &str) -> Result<(DynamicImage, f64, f64)> {
                 *val = dyn_image.get_pixel(x, y).0[0];
             }
         });
-    debug!(
+    trace!(
         "finished preprocessing in {} ns",
         instant.elapsed().as_nanos()
     );
     Ok((
-        DynamicImage::ImageLuma8(
-            ImageBuffer::from_vec(DEFAULT_WIDTH, DEFAULT_HEIGHT, pixel_values).unwrap(),
-        ),
+        ImageBuffer::from_vec(DEFAULT_WIDTH, DEFAULT_HEIGHT, pixel_values).unwrap(),
         adjust_x,
         adjust_y,
     ))
@@ -241,6 +248,10 @@ fn generate_gt_and_mask_images(
                 )
             })
             .collect::<Vec<Point<i32>>>();
+        if poly_values.len() < 4 {
+            ignore_flags[pos] = true;
+            continue;
+        }
         if poly_height.min(poly_width) < MIN_TEXT_SIZE {
             drawing::draw_polygon_mut(&mut mask_image, &poly_values, BLACK_COLOR);
             ignore_flags[pos] = true;
@@ -258,21 +269,18 @@ fn load_polygons(file_path: &str) -> Result<Vec<Tensor>> {
         file.read_to_string(&mut content)?;
         polygons = content
             .split_terminator('\n')
+            .collect::<Vec<&str>>()
+            .par_iter()
             .map(|row| {
                 // row is in format
                 // x1,y1,x2,y2,...,x{n},y{n},{FOUND TEXT}
                 // where n is number of points in the polygon (not a fixed value)
 
-                let values = row
-                    .split_terminator(',')
-                    .filter_map(|v| {
-                        if let Ok(value_i32) = v.parse::<i32>() {
-                            Some(value_i32)
-                        } else {
-                            // ignore the text
-                            None
-                        }
-                    })
+                let raw_values = row.split_terminator(',').collect::<Vec<&str>>();
+
+                let values = raw_values[0..raw_values.len() - 1]
+                    .iter()
+                    .flat_map(|v| v.parse())
                     .collect::<Vec<i32>>();
                 Tensor::of_slice(&values).view((-1, 2))
             })
@@ -284,25 +292,227 @@ fn load_polygons(file_path: &str) -> Result<Vec<Tensor>> {
     Ok(polygons)
 }
 
-pub fn load_text_detection_image(file_path: &str) -> Result<()> {
+pub fn load_text_detection_image(file_path: &str) -> Result<(Tensor, Tensor, Tensor)> {
     let instant = Instant::now();
     let (preprocessed_image, adjust_x, adjust_y) = preprocess_image(file_path)?;
 
     let path_parts = file_path.split_terminator('/').collect::<Vec<&str>>();
     let last_idx = path_parts.len() - 1;
     let polygons = load_polygons(&format!(
-        "text-detection-images/totaltext/gts/{}/{}.txt",
+        "{}/gts/{}/{}.txt",
+        TEXT_DET_IMAGES_PATH,
         path_parts[last_idx - 1],
         path_parts[last_idx]
     ))?;
 
-    let (gt_image, mask_image, ignore_flags) =
+    let (gt_image, mask_image, _ignore_flags) =
         generate_gt_and_mask_images(&polygons, adjust_x, adjust_y)?;
+    let image_tensor = create_tensor_from_image(&preprocessed_image)?;
+    let gt_tensor = (create_tensor_from_image(&gt_image)? / 255.).to_kind(Kind::Uint8);
+    let mask_tensor = (create_tensor_from_image(&mask_image)? / 255.).to_kind(Kind::Uint8);
 
-    debug!(
+    trace!(
         "finished loading and preparing text detection images in {:?} ns",
         instant.elapsed().as_nanos()
     );
 
-    Ok(())
+    Ok((image_tensor, gt_tensor, mask_tensor))
+}
+
+fn create_tensor_from_image(image: &GrayImage) -> Result<Tensor> {
+    let w = image.width() as usize;
+    let h = image.height() as usize;
+    let mut pixel_values = vec![0f64; w * h];
+    pixel_values
+        .par_iter_mut()
+        .enumerate()
+        .for_each(|(n, val)| {
+            let y = n as u32 / w as u32;
+            let x = n as u32 - y * w as u32;
+
+            *val = image.get_pixel(x, y).0[0] as f64;
+        });
+    Ok(Tensor::of_slice(&pixel_values).view((w as i64, h as i64)))
+}
+
+pub fn load_text_detection_images() -> Result<TextDetectionDataset> {
+    trace!("loading text detection values");
+    let instant = Instant::now();
+    let (train_images, train_gt, train_mask) =
+        load_text_det_values_from_file(TEXT_DET_IMAGES_PATH, true)?;
+    let (test_images, test_gt, test_mask) =
+        load_text_det_values_from_file(TEXT_DET_IMAGES_PATH, false)?;
+    trace!(
+        "Finished loading values in {} ms",
+        instant.elapsed().as_millis()
+    );
+
+    Ok(TextDetectionDataset {
+        train_images,
+        train_gt,
+        train_mask,
+        test_images,
+        test_gt,
+        test_mask,
+    })
+}
+
+pub fn generate_text_det_tensor_chunks(images_base_dir: &str, train: bool) -> Result<()> {
+    let instant = Instant::now();
+    let images_file;
+    let gt_file;
+    let mask_file;
+    let window_size;
+    let target_dir;
+    if train {
+        images_file = TEXT_DET_TRAIN_IMAGES_FILE;
+        gt_file = TEXT_DET_TRAIN_GT_FILE;
+        mask_file = TEXT_DET_TRAIN_MASK_FILE;
+        window_size = 40;
+        target_dir = "train";
+    } else {
+        images_file = TEXT_DET_TEST_IMAGES_FILE;
+        gt_file = TEXT_DET_TEST_GT_FILE;
+        mask_file = TEXT_DET_TEST_MASK_FILE;
+        window_size = 10;
+        target_dir = "test";
+    };
+
+    let images_dir = format!("{}/images/{}", images_base_dir, target_dir);
+    if let Ok(files) = fs::read_dir(&images_dir) {
+        let filenames: Vec<String> = files
+            .map(|f| f.unwrap().path().display().to_string())
+            .collect();
+
+        filenames
+            .chunks(window_size)
+            .enumerate()
+            .for_each(|(pos, chunk)| {
+                let (images, gts, masks) = chunk
+                    .par_iter()
+                    .fold(
+                        || {
+                            (
+                                Tensor::of_slice(&[0]),
+                                Tensor::of_slice(&[0]),
+                                Tensor::of_slice(&[0]),
+                            )
+                        },
+                        |(mut im_acc, mut gt_acc, mut mask_acc), filename| {
+                            if TEXT_DET_FILE_NAME_FORMAT_REGEX.captures(filename).is_some() {
+                                match load_text_detection_image(filename) {
+                                    Ok((im, gt, mask)) => {
+                                        if im_acc.numel() == 1 {
+                                            return (im, gt, mask);
+                                        }
+                                        im_acc = Tensor::cat(&[im_acc, im], 0);
+                                        gt_acc = Tensor::cat(&[gt_acc, gt], 0);
+                                        mask_acc = Tensor::cat(&[mask_acc, mask], 0);
+                                    }
+                                    Err(msg) => {
+                                        error!("Error while loading single image data: {}", msg);
+                                    }
+                                }
+                            }
+                            (im_acc, gt_acc, mask_acc)
+                        },
+                    )
+                    .reduce(
+                        || {
+                            (
+                                Tensor::of_slice(&[0]),
+                                Tensor::of_slice(&[0]),
+                                Tensor::of_slice(&[0]),
+                            )
+                        },
+                        |(im_acc, gt_acc, mask_acc), (part_im, part_gt, part_mask)| {
+                            if im_acc.numel() == 1 {
+                                return (part_im, part_gt, part_mask);
+                            }
+                            (
+                                Tensor::cat(&[im_acc, part_im], 0),
+                                Tensor::cat(&[gt_acc, part_gt], 0),
+                                Tensor::cat(&[mask_acc, part_mask], 0),
+                            )
+                        },
+                    );
+                let mut save_res = images
+                    .view((-1, DEFAULT_WIDTH as i64, DEFAULT_HEIGHT as i64))
+                    .save(format!("{}.{}", images_file, pos));
+                if let Err(msg) = save_res {
+                    error!("Error while saving image tensor {}", msg);
+                }
+                save_res = gts
+                    .view((-1, DEFAULT_WIDTH as i64, DEFAULT_HEIGHT as i64))
+                    .save(format!("{}.{}", gt_file, pos));
+                if let Err(msg) = save_res {
+                    error!("Error while saving gt tensor {}", msg);
+                }
+                save_res = masks
+                    .view((-1, DEFAULT_WIDTH as i64, DEFAULT_HEIGHT as i64))
+                    .save(format!("{}.{}", mask_file, pos));
+                if let Err(msg) = save_res {
+                    error!("Error while saving mask tensor {}", msg);
+                }
+            });
+        trace!(
+            "finished generating tensors in {} ms",
+            instant.elapsed().as_millis()
+        );
+        Ok(())
+    } else {
+        Err(anyhow!(
+            "didn't find text detection images dir: {}",
+            images_dir
+        ))
+    }
+}
+
+fn load_text_det_values_from_file(
+    images_base_dir: &str,
+    train: bool,
+) -> Result<(Tensor, Tensor, Tensor)> {
+    debug!("loading text detection file train: {}", train);
+    let (images_file, gt_file, mask_file) = if train {
+        (
+            TEXT_DET_TRAIN_IMAGES_FILE,
+            TEXT_DET_TRAIN_GT_FILE,
+            TEXT_DET_TRAIN_MASK_FILE,
+        )
+    } else {
+        (
+            TEXT_DET_TEST_IMAGES_FILE,
+            TEXT_DET_TEST_GT_FILE,
+            TEXT_DET_TEST_MASK_FILE,
+        )
+    };
+    if Path::new(images_file).exists()
+        && Path::new(gt_file).exists()
+        && Path::new(mask_file).exists()
+    {
+        Ok((
+            Tensor::load(images_file)?,
+            Tensor::load(gt_file)?,
+            Tensor::load(mask_file)?,
+        ))
+    } else {
+        Err(anyhow!("One of the files doesn't exist"))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tch::{Device, Tensor};
+
+    #[test]
+    fn tensor_cat() {
+        let device = Device::cuda_if_available();
+        let zeros = Tensor::zeros(&[2, 3], (Kind::Float, device));
+        let ones = Tensor::ones(&[2, 3], (Kind::Float, device));
+        assert_eq!(
+            Tensor::cat(&[zeros, ones], 0).view((-1, 2, 3)),
+            Tensor::of_slice(&[0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 1, 1]).view((2, 2, 3))
+        );
+    }
 }
