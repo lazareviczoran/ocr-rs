@@ -500,9 +500,219 @@ fn load_text_det_values_from_file(
     }
 }
 
+/// Finds contours on the provided image. Works on binarized images only.
+pub fn find_contours(original_image: &GrayImage) -> Result<Vec<Vec<(usize, usize)>>> {
+    use std::collections::VecDeque;
+    let mut nbd = 1;
+    let mut _lnbd = 1;
+    let mut pos2 = (0, 0);
+    let mut skip_tracing;
+    let mut image =
+        vec![vec![0i32; original_image.height() as usize]; original_image.width() as usize];
+
+    for y in 0..original_image.height() {
+        for x in 0..original_image.width() {
+            if original_image.get_pixel(x, y).0[0] > 0 {
+                image[x as usize][y as usize] = 1;
+            }
+        }
+    }
+    let mut neighbour_indices_diffs = VecDeque::from(vec![
+        (-1, 0),
+        (-1, -1),
+        (0, -1),
+        (1, -1),
+        (1, 0),
+        (1, 1),
+        (0, 1),
+        (-1, 1),
+    ]);
+    let mut x = 0;
+    let mut y = 0;
+    let last_pixel = (image.len() - 1, image[0].len() - 1);
+
+    let mut contours = Vec::new();
+
+    while (x, y) != last_pixel {
+        if image[x][y] != 0 {
+            skip_tracing = false;
+            if image[x][y] == 1 && x > 0 && image[x - 1][y] == 0 {
+                nbd += 1;
+                pos2 = (x - 1, y);
+            } else if image[x][y] > 0 && x < image.len() - 1 && image[x + 1][y] == 0 {
+                nbd += 1;
+                pos2 = (x + 1, y);
+                if image[x][y] > 1 {
+                    _lnbd = image[x][y];
+                }
+            } else {
+                skip_tracing = true;
+            }
+
+            if !skip_tracing {
+                let x_i32 = x as i32;
+                let y_i32 = y as i32;
+                let initial_pos_diff = (pos2.0 as i32 - x_i32, pos2.1 as i32 - y_i32);
+                let rotate_pos = neighbour_indices_diffs
+                    .iter()
+                    .position(|&x| x == initial_pos_diff)
+                    .unwrap();
+                neighbour_indices_diffs.rotate_left(rotate_pos);
+                if let Some(pos1) = neighbour_indices_diffs
+                    .iter()
+                    .find(|(x_diff, y_diff)| {
+                        let curr_x = x_i32 + *x_diff;
+                        let curr_y = y_i32 + *y_diff;
+                        curr_x > -1
+                            && curr_x < image.len() as i32
+                            && curr_y > -1
+                            && curr_y < image[0].len() as i32
+                            && image[curr_x as usize][curr_y as usize] > 0
+                    })
+                    .map(|diff| ((x as i32 + diff.0) as usize, (y as i32 + diff.1) as usize))
+                {
+                    contours.push(Vec::new());
+                    pos2 = pos1;
+                    let mut pos3 = (x, y);
+                    loop {
+                        contours[nbd as usize - 2].push(pos3);
+                        let initial_pos_diff =
+                            (pos2.0 as i32 - pos3.0 as i32, pos2.1 as i32 - pos3.1 as i32);
+                        let rotate_pos = neighbour_indices_diffs
+                            .iter()
+                            .position(|&x| x == initial_pos_diff)
+                            .unwrap();
+                        neighbour_indices_diffs.rotate_left(rotate_pos);
+                        let pos4 = neighbour_indices_diffs
+                            .iter()
+                            .rev()
+                            .find(|(x_diff, y_diff)| {
+                                let curr_x = pos3.0 as i32 + *x_diff;
+                                let curr_y = pos3.1 as i32 + *y_diff;
+                                curr_x > -1
+                                    && curr_x < image.len() as i32
+                                    && curr_y > -1
+                                    && curr_y < image[0].len() as i32
+                                    && image[curr_x as usize][curr_y as usize] != 0
+                            })
+                            .map(|diff| {
+                                (
+                                    (pos3.0 as i32 + diff.0) as usize,
+                                    (pos3.1 as i32 + diff.1) as usize,
+                                )
+                            })
+                            .unwrap();
+
+                        if pos3.0 + 1 >= image.len() || image[pos3.0 + 1][pos3.1] == 0 {
+                            image[pos3.0][pos3.1] = -nbd;
+                        }
+                        if (pos3.0 + 1 >= image.len() || image[pos3.0 + 1][pos3.1] != 0)
+                            && image[pos3.0][pos3.1] == 1
+                        {
+                            image[pos3.0][pos3.1] = nbd;
+                        }
+                        if pos4 == (x, y) && pos3 == pos1 {
+                            break;
+                        }
+                        pos2 = pos3;
+                        pos3 = pos4;
+                    }
+                } else {
+                    image[x][y] = -nbd;
+                }
+            }
+
+            if image[x][y] != 1 {
+                _lnbd = image[x][y].abs();
+            }
+        }
+        if x == last_pixel.0 {
+            x = 0;
+            y += 1;
+            _lnbd = 1;
+        } else {
+            x += 1;
+        }
+    }
+
+    Ok(contours)
+}
+
+fn arc_lenght(arc: &[(usize, usize)], closed: bool) -> f64 {
+    let mut length = arc.windows(2).fold(0., |acc, pts| {
+        acc + ((pts[0].0 as f64 - pts[1].0 as f64).powf(2.)
+            + (pts[0].1 as f64 - pts[1].1 as f64).powf(2.))
+        .sqrt()
+    });
+    if closed {
+        length += ((arc[0].0 as f64 - arc[arc.len() - 1].0 as f64).powf(2.)
+            + (arc[0].1 as f64 - arc[arc.len() - 1].1 as f64).powf(2.))
+        .sqrt();
+    }
+    length
+}
+
+fn approx_poly_dp(curve: &[(usize, usize)], epsilon: f64, closed: bool) -> Vec<(usize, usize)> {
+    // Find the point with the maximum distance
+    let mut dmax = 0.;
+    let mut index = 0;
+    let end = curve.len() - 1;
+    let line_args = line_params(&[curve[0], curve[end]]);
+    for (i, point) in curve.iter().enumerate().skip(1) {
+        let d = perpendicular_distance(line_args, *point);
+        if d > dmax {
+            index = i;
+            dmax = d;
+        }
+    }
+
+    let mut res = Vec::new();
+
+    // If max distance is greater than epsilon, recursively simplify
+    if dmax > epsilon {
+        // Recursive call
+        let mut partial1 = approx_poly_dp(&curve[0..=index], epsilon, false);
+        let mut partial2 = approx_poly_dp(&curve[index..=end], epsilon, false);
+
+        // Build the result list
+        partial1.pop();
+        res.append(&mut partial1);
+        res.append(&mut partial2);
+    } else {
+        res.push(curve[0]);
+        res.push(curve[end]);
+    }
+
+    if closed {
+        res.pop();
+    }
+
+    res
+}
+
+fn line_params(points: &[(usize, usize)]) -> (f64, f64, f64) {
+    let p1 = points[0];
+    let p2 = points[1];
+    let a = p1.1 as f64 - p2.1 as f64;
+    let b = p2.0 as f64 - p1.0 as f64;
+    let c = (p1.0 * p2.1) as f64 - (p2.0 * p1.1) as f64;
+
+    (a, b, c)
+}
+
+#[allow(clippy::many_single_char_names)]
+fn perpendicular_distance(line_args: (f64, f64, f64), point: (usize, usize)) -> f64 {
+    let (a, b, c) = line_args;
+    let (x, y) = point;
+
+    (a * x as f64 + b * y as f64 + c).abs() / (a.powf(2.) + b.powf(2.)).sqrt()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use image::open;
+    use imageproc::drawing::{draw_polygon_mut, Point};
     use tch::{Device, Tensor};
 
     #[test]
@@ -513,6 +723,64 @@ mod tests {
         assert_eq!(
             Tensor::cat(&[zeros, ones], 0).view((-1, 2, 3)),
             Tensor::of_slice(&[0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 1, 1]).view((2, 2, 3))
+        );
+    }
+
+    #[test]
+    fn find_contours_test() {
+        let image = open("polygon.png").unwrap().to_luma();
+        let contours = find_contours(&image).unwrap();
+        assert_eq!(contours.len(), 6);
+    }
+
+    #[test]
+    fn line_params_test() {
+        let p1 = (5, 7);
+        let p2 = (10, 3);
+        assert_eq!(line_params(&[p1, p2]), (4., 5., -55.));
+    }
+
+    #[test]
+    fn perpendicular_distance_test() {
+        let line_args = (8., 7., 5.);
+        let point = (2, 3);
+        assert!(perpendicular_distance(line_args, point) - 3.9510276472 < 1e-10);
+    }
+
+    #[test]
+    fn get_contours_approx_points() {
+        let mut image = GrayImage::from_pixel(300, 300, Luma([0]));
+        let white = Luma([255]);
+
+        let star = vec![
+            Point::new(100, 20),
+            Point::new(120, 35),
+            Point::new(140, 30),
+            Point::new(115, 45),
+            Point::new(130, 60),
+            Point::new(100, 50),
+            Point::new(80, 55),
+            Point::new(90, 40),
+            Point::new(60, 25),
+            Point::new(90, 35),
+        ];
+        draw_polygon_mut(&mut image, &star, white);
+        let contours = find_contours(&image).unwrap();
+        let c1_approx = approx_poly_dp(&contours[0], arc_lenght(&contours[0], true) * 0.01, true);
+        assert_eq!(
+            c1_approx,
+            vec![
+                (100, 20),
+                (90, 35),
+                (60, 25),
+                (90, 40),
+                (80, 55),
+                (101, 50),
+                (130, 60),
+                (115, 45),
+                (140, 30),
+                (120, 35)
+            ]
         );
     }
 }
