@@ -6,6 +6,9 @@ use imageproc::drawing::{self, Point};
 use log::{debug, error, trace};
 use rayon::prelude::*;
 use regex::Regex;
+use std::cmp::Ordering;
+use std::collections::VecDeque;
+use std::f64::consts::PI;
 use std::fs::{self, File};
 use std::io::prelude::*;
 use std::path::Path;
@@ -307,7 +310,7 @@ pub fn load_text_detection_image(file_path: &str) -> Result<(Tensor, Tensor, Ten
 
     let (gt_image, mask_image, _ignore_flags) =
         generate_gt_and_mask_images(&polygons, adjust_x, adjust_y)?;
-    let image_tensor = create_tensor_from_image(&preprocessed_image)?;
+    let image_tensor = create_tensor_from_image(&preprocessed_image)?.to_kind(Kind::Uint8);
     let gt_tensor = (create_tensor_from_image(&gt_image)? / 255.).to_kind(Kind::Uint8);
     let mask_tensor = (create_tensor_from_image(&mask_image)? / 255.).to_kind(Kind::Uint8);
 
@@ -335,26 +338,75 @@ fn create_tensor_from_image(image: &GrayImage) -> Result<Tensor> {
     Ok(Tensor::of_slice(&pixel_values).view((w as i64, h as i64)))
 }
 
-pub fn load_text_detection_images() -> Result<TextDetectionDataset> {
-    trace!("loading text detection values");
-    let instant = Instant::now();
-    let (train_images, train_gt, train_mask) =
-        load_text_det_values_from_file(TEXT_DET_IMAGES_PATH, true)?;
-    let (test_images, test_gt, test_mask) =
-        load_text_det_values_from_file(TEXT_DET_IMAGES_PATH, false)?;
-    trace!(
-        "Finished loading values in {} ms",
-        instant.elapsed().as_millis()
-    );
+pub fn create_image_from_tensor(tensor: &Tensor) -> Result<GrayImage> {
+    // image size (W x H)
+    let w = tensor.size()[0] as usize;
+    let h = tensor.size()[1] as usize;
+    let mut pixel_values = vec![0; w * h];
+    pixel_values.iter_mut().enumerate().for_each(|(n, val)| {
+        let y = n as i64 / w as i64;
+        let x = n as i64 - y * w as i64;
+        *val = tensor.int64_value(&[x, y]) as u8;
+    });
+    Ok(ImageBuffer::from_vec(w as u32, h as u32, pixel_values).unwrap())
+}
 
-    Ok(TextDetectionDataset {
-        train_images,
-        train_gt,
-        train_mask,
-        test_images,
-        test_gt,
-        test_mask,
-    })
+pub fn load_text_detection_tensor_files(target_dir: &str) -> Result<TextDetectionDataset> {
+    if let Ok(files) = fs::read_dir(&target_dir) {
+        let mut train_images = Vec::new();
+        let mut train_gt = Vec::new();
+        let mut train_mask = Vec::new();
+        let mut test_images = Vec::new();
+        let mut test_gt = Vec::new();
+        let mut test_mask = Vec::new();
+        files.for_each(|f| {
+            let file = f.unwrap();
+            let filename = file.file_name().into_string().unwrap();
+            let path = file.path().display().to_string();
+            if filename.starts_with(TEXT_DET_TRAIN_IMAGES_FILE) {
+                train_images.push(path);
+            } else if filename.starts_with(TEXT_DET_TRAIN_GT_FILE) {
+                train_gt.push(path);
+            } else if filename.starts_with(TEXT_DET_TRAIN_MASK_FILE) {
+                train_mask.push(path);
+            } else if filename.starts_with(TEXT_DET_TEST_IMAGES_FILE) {
+                test_images.push(path);
+            } else if filename.starts_with(TEXT_DET_TEST_GT_FILE) {
+                test_gt.push(path);
+            } else if filename.starts_with(TEXT_DET_TEST_MASK_FILE) {
+                test_mask.push(path);
+            }
+        });
+        if train_images.len() != train_gt.len() || train_images.len() != train_mask.len() {
+            return Err(
+                anyhow!(
+                    "training tensors number doesn't match: images tensors {} - gt tensors {} - mask tensors {}",
+                    train_images.len(),
+                    train_gt.len(),
+                    train_mask.len()
+                )
+            );
+        } else if test_images.len() != test_gt.len() || test_images.len() != test_mask.len() {
+            return Err(
+                anyhow!(
+                    "test tensors number doesn't match: images tensors {} - gt tensors {} - mask tensors {}",
+                    test_images.len(),
+                    test_gt.len(),
+                    test_mask.len()
+                )
+            );
+        }
+        Ok(TextDetectionDataset {
+            train_images,
+            train_gt,
+            train_mask,
+            test_images,
+            test_gt,
+            test_mask,
+        })
+    } else {
+        Err(anyhow!("The directory doesn't exist"))
+    }
 }
 
 pub fn generate_text_det_tensor_chunks(images_base_dir: &str, train: bool) -> Result<()> {
@@ -468,41 +520,8 @@ pub fn generate_text_det_tensor_chunks(images_base_dir: &str, train: bool) -> Re
     }
 }
 
-fn load_text_det_values_from_file(
-    images_base_dir: &str,
-    train: bool,
-) -> Result<(Tensor, Tensor, Tensor)> {
-    debug!("loading text detection file train: {}", train);
-    let (images_file, gt_file, mask_file) = if train {
-        (
-            TEXT_DET_TRAIN_IMAGES_FILE,
-            TEXT_DET_TRAIN_GT_FILE,
-            TEXT_DET_TRAIN_MASK_FILE,
-        )
-    } else {
-        (
-            TEXT_DET_TEST_IMAGES_FILE,
-            TEXT_DET_TEST_GT_FILE,
-            TEXT_DET_TEST_MASK_FILE,
-        )
-    };
-    if Path::new(images_file).exists()
-        && Path::new(gt_file).exists()
-        && Path::new(mask_file).exists()
-    {
-        Ok((
-            Tensor::load(images_file)?,
-            Tensor::load(gt_file)?,
-            Tensor::load(mask_file)?,
-        ))
-    } else {
-        Err(anyhow!("One of the files doesn't exist"))
-    }
-}
-
 /// Finds contours on the provided image. Works on binarized images only.
 pub fn find_contours(original_image: &GrayImage) -> Result<Vec<Vec<(usize, usize)>>> {
-    use std::collections::VecDeque;
     let mut nbd = 1;
     let mut _lnbd = 1;
     let mut pos2 = (0, 0);
@@ -708,6 +727,157 @@ fn perpendicular_distance(line_args: (f64, f64, f64), point: (usize, usize)) -> 
     (a * x as f64 + b * y as f64 + c).abs() / (a.powf(2.) + b.powf(2.)).sqrt()
 }
 
+fn min_area_rect(contour: &[(usize, usize)]) -> Vec<(usize, usize)> {
+    let hull = convex_hull(&contour);
+    match hull.len() {
+        0 => panic!("no points are defined"),
+        1 => vec![hull[0]; 4],
+        2 => vec![hull[0], hull[1], hull[1], hull[0]],
+        _ => rotating_calipers(&hull),
+    }
+}
+
+fn rotating_calipers(points: &[(usize, usize)]) -> Vec<(usize, usize)> {
+    let n = points.len();
+    let edges: Vec<(f64, f64)> = (0..n - 1)
+        .map(|i| {
+            let next = i + 1;
+            (
+                points[next].0 as f64 - points[i].0 as f64,
+                points[next].1 as f64 - points[i].1 as f64,
+            )
+        })
+        .collect();
+
+    let mut edge_angles: Vec<f64> = edges
+        .iter()
+        .map(|e| ((e.1.atan2(e.0) + PI) % (PI / 2.)).abs())
+        .collect();
+    edge_angles.dedup();
+
+    let mut min_area = std::f64::MAX;
+    let mut res = [(0., 0.); 4];
+    for angle in edge_angles {
+        let r = [[angle.cos(), -angle.sin()], [angle.sin(), angle.cos()]];
+
+        let rotated_points: Vec<(f64, f64)> = points
+            .iter()
+            .map(|p| {
+                (
+                    p.0 as f64 * r[0][0] + p.1 as f64 * r[1][0],
+                    p.0 as f64 * r[0][1] + p.1 as f64 * r[1][1],
+                )
+            })
+            .collect();
+        let (min_x, max_x, min_y, max_y) = rotated_points.iter().fold(
+            (std::f64::MAX, std::f64::MIN, std::f64::MAX, std::f64::MIN),
+            |acc, p| {
+                (
+                    acc.0.min(p.0),
+                    acc.1.max(p.0),
+                    acc.2.min(p.1),
+                    acc.3.max(p.1),
+                )
+            },
+        );
+        let area = (max_x - min_x) * (max_y - min_y);
+        if area < min_area {
+            min_area = area;
+
+            res[0] = (
+                max_x * r[0][0] + min_y * r[0][1],
+                max_x * r[1][0] + min_y * r[1][1],
+            );
+            res[1] = (
+                min_x * r[0][0] + min_y * r[0][1],
+                min_x * r[1][0] + min_y * r[1][1],
+            );
+            res[2] = (
+                min_x * r[0][0] + max_y * r[0][1],
+                min_x * r[1][0] + max_y * r[1][1],
+            );
+            res[3] = (
+                max_x * r[0][0] + max_y * r[0][1],
+                max_x * r[1][0] + max_y * r[1][1],
+            );
+        }
+    }
+
+    res.iter()
+        .map(|(x, y)| (x.round() as usize, y.round() as usize))
+        .collect()
+}
+
+///
+/// Finds points of the smallest convex polygon that contains all the contour points.
+/// https://en.wikipedia.org/wiki/Graham_scan
+///
+fn convex_hull(points_slice: &[(usize, usize)]) -> Vec<(usize, usize)> {
+    let mut points = Vec::from(points_slice);
+    let (start_point_pos, start_point) = points.iter().enumerate().fold(
+        (std::usize::MAX, (std::usize::MAX, std::usize::MAX)),
+        |(pos, p0), (i, &point)| {
+            if point.1 < p0.1 || point.1 == p0.1 && point.0 < p0.0 {
+                return (i, point);
+            }
+            (pos, p0)
+        },
+    );
+    points.swap(0, start_point_pos);
+    points.remove(0);
+    points.sort_by(|a, b| {
+        let orientation = get_orientation(&start_point, a, b);
+        if orientation == 0 {
+            if get_distance(&start_point, a) < get_distance(&start_point, b) {
+                return std::cmp::Ordering::Less;
+            }
+            return std::cmp::Ordering::Greater;
+        }
+        if orientation == 2 {
+            std::cmp::Ordering::Less
+        } else {
+            std::cmp::Ordering::Greater
+        }
+    });
+
+    let mut iter = points.iter().peekable();
+    let mut remaining_points = Vec::with_capacity(points.len());
+    while let Some(mut p) = iter.next() {
+        while iter.peek().is_some() && get_orientation(&start_point, p, iter.peek().unwrap()) == 0 {
+            p = iter.next().unwrap();
+        }
+        remaining_points.push(p);
+    }
+
+    let mut stack = vec![start_point];
+
+    for point in points.iter() {
+        while stack.len() > 1
+            && get_orientation(&stack[stack.len() - 2], &stack[stack.len() - 1], point) != 2
+        {
+            stack.pop();
+        }
+        stack.push(*point);
+    }
+    stack
+}
+
+fn get_orientation(p: &(usize, usize), q: &(usize, usize), r: &(usize, usize)) -> u8 {
+    let val = (q.1 as i32 - p.1 as i32) * (r.0 as i32 - q.0 as i32)
+        - (q.0 as i32 - p.0 as i32) * (r.1 as i32 - q.1 as i32);
+    match val.cmp(&0) {
+        Ordering::Equal => 0,   // colinear
+        Ordering::Greater => 1, // clockwise (right)
+        Ordering::Less => 2,    // counter-clockwise (left)
+    }
+}
+
+fn get_distance(p1: &(usize, usize), p2: &(usize, usize)) -> f64 {
+    ((p1.0 as f64 - p2.0 as f64) * (p1.0 as f64 - p2.0 as f64)
+        + (p1.1 as f64 - p2.1 as f64) * (p1.1 as f64 - p2.1 as f64))
+        .sqrt()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -782,5 +952,43 @@ mod tests {
                 (120, 35)
             ]
         );
+    }
+
+    #[test]
+    fn get_convex_hull_points() {
+        let star = vec![
+            (100, 20),
+            (90, 35),
+            (60, 25),
+            (90, 40),
+            (80, 55),
+            (101, 50),
+            (130, 60),
+            (115, 45),
+            (140, 30),
+            (120, 35),
+        ];
+        let points = convex_hull(&star);
+        assert_eq!(
+            points,
+            [(100, 20), (140, 30), (130, 60), (80, 55), (60, 25)]
+        );
+    }
+
+    #[test]
+    fn min_area_test() {
+        let mut image = GrayImage::from_pixel(300, 300, Luma([0]));
+        let white = Luma([255]);
+
+        let polygon = min_area_rect(&[(100, 20), (140, 30), (130, 60), (80, 55), (60, 25)])
+            .iter()
+            .map(|p| Point::new(p.0 as i32, p.1 as i32))
+            .collect::<Vec<Point<i32>>>();
+
+        draw_polygon_mut(&mut image, &polygon, white);
+        assert_eq!(
+            min_area_rect(&[(100, 20), (140, 30), (130, 60), (80, 55), (60, 25)]),
+            [(60, 20), (140, 20), (140, 60), (60, 60)]
+        )
     }
 }
