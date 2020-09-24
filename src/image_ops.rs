@@ -65,12 +65,9 @@ pub fn load_image_as_tensor(file_path: &str) -> Result<Tensor> {
     if !Path::new(file_path).exists() {
         return Err(anyhow!("File {} doesn't exist", file_path));
     }
-    let image_pixels = get_image_pixel_colors_grayscale(file_path)?;
-
-    let images_tensor = Tensor::of_slice(&image_pixels)
-        .view((1, image_pixels.len() as i64))
-        .to_kind(Kind::Float)
-        / 255.;
+    let image = open(file_path)?.into_luma();
+    let dim = image.width() * image.height();
+    let images_tensor = convert_image_to_tensor(&image)?.view((1, dim as i64)) / 255.;
     Ok(images_tensor)
 }
 
@@ -110,10 +107,10 @@ fn load_values_from_file(file_path: &str) -> Result<Tensor> {
 fn load_images(dir_path: &str) -> Result<Tensor> {
     if let Ok(files) = fs::read_dir(dir_path) {
         let files_info: Vec<std::fs::DirEntry> = files.map(|f| f.unwrap()).collect();
-        let (pixels, rows, cols) = files_info
+        let (images_tensor, rows, cols) = files_info
             .par_iter()
             .fold(
-                || (Vec::new(), 0, 0),
+                || (Tensor::new(), 0, 0),
                 |(mut p_vec, mut rows, mut cols), file| {
                     let filename = file.file_name();
                     if CHAR_REC_FILE_NAME_FORMAT_REGEX
@@ -121,28 +118,30 @@ fn load_images(dir_path: &str) -> Result<Tensor> {
                         .is_some()
                     {
                         rows += 1;
-                        let mut image_pixels =
-                            get_image_pixel_colors_grayscale(&file.path().display().to_string())
-                                .unwrap();
-                        cols = image_pixels.len();
-                        p_vec.append(&mut image_pixels);
+                        let image = open(&file.path().display().to_string())
+                            .unwrap()
+                            .into_luma();
+                        let image_tensor = convert_image_to_tensor(&image)
+                            .unwrap()
+                            .view((1, (image.width() * image.height()) as i64));
+                        cols = image_tensor.size()[1];
+                        p_vec = Tensor::cat(&[p_vec, image_tensor], 0);
                     }
                     (p_vec, rows, cols)
                 },
             )
             .reduce(
-                || (Vec::new(), 0, 0),
-                |(mut acc_vec, total_rows, _), (mut partial, p_rows, p_cols)| {
-                    acc_vec.append(&mut partial);
-                    (acc_vec, total_rows + p_rows, p_cols)
+                || (Tensor::new(), 0, 0),
+                |(acc_vec, total_rows, _), (partial, p_rows, p_cols)| {
+                    (
+                        Tensor::cat(&[acc_vec, partial], 0),
+                        total_rows + p_rows,
+                        p_cols,
+                    )
                 },
             );
         trace!("Creating tensor for images r-{} c-{}", rows, cols);
-        let images_tensor = Tensor::of_slice(&pixels)
-            .view((rows as i64, cols as i64))
-            .to_kind(Kind::Float)
-            / 255.;
-        return Ok(images_tensor);
+        return Ok(images_tensor.view((rows as i64, cols as i64)) / 255.);
     }
     Err(anyhow!("Could not open dir {}", dir_path))
 }
@@ -180,18 +179,6 @@ fn load_labels(dir_path: &str) -> Result<Tensor> {
         return Ok(labels_tensor);
     }
     Err(anyhow!("Could not open dir {}", dir_path))
-}
-
-fn get_image_pixel_colors_grayscale(file_path: &str) -> Result<Vec<u8>> {
-    let rgba_image = open(file_path)?.into_rgba();
-    let gray_image = DynamicImage::ImageRgba8(rgba_image).into_luma();
-    let mut pixels = vec![0; (gray_image.width() * gray_image.height()) as usize];
-    pixels.par_iter_mut().enumerate().for_each(|(n, val)| {
-        let y = n as u32 / gray_image.width();
-        let x = n as u32 - y * gray_image.width();
-        *val = gray_image.get_pixel(x, y).0[0];
-    });
-    Ok(pixels)
 }
 
 pub fn preprocess_image(file_path: &str) -> Result<(GrayImage, f64, f64)> {
@@ -310,9 +297,9 @@ pub fn load_text_detection_image(file_path: &str) -> Result<(Tensor, Tensor, Ten
 
     let (gt_image, mask_image, _ignore_flags) =
         generate_gt_and_mask_images(&polygons, adjust_x, adjust_y)?;
-    let image_tensor = create_tensor_from_image(&preprocessed_image)?.to_kind(Kind::Uint8);
-    let gt_tensor = (create_tensor_from_image(&gt_image)? / 255.).to_kind(Kind::Uint8);
-    let mask_tensor = (create_tensor_from_image(&mask_image)? / 255.).to_kind(Kind::Uint8);
+    let image_tensor = convert_image_to_tensor(&preprocessed_image)?.to_kind(Kind::Uint8);
+    let gt_tensor = (convert_image_to_tensor(&gt_image)? / 255.).to_kind(Kind::Uint8);
+    let mask_tensor = (convert_image_to_tensor(&mask_image)? / 255.).to_kind(Kind::Uint8);
 
     trace!(
         "finished loading and preparing text detection images in {:?} ns",
@@ -322,7 +309,8 @@ pub fn load_text_detection_image(file_path: &str) -> Result<(Tensor, Tensor, Ten
     Ok((image_tensor, gt_tensor, mask_tensor))
 }
 
-fn create_tensor_from_image(image: &GrayImage) -> Result<Tensor> {
+/// image size (w, h)
+pub fn convert_image_to_tensor(image: &GrayImage) -> Result<Tensor> {
     let w = image.width() as usize;
     let h = image.height() as usize;
     let mut pixel_values = vec![0f64; w * h];
@@ -335,18 +323,19 @@ fn create_tensor_from_image(image: &GrayImage) -> Result<Tensor> {
 
             *val = image.get_pixel(x, y).0[0] as f64;
         });
-    Ok(Tensor::of_slice(&pixel_values).view((w as i64, h as i64)))
+    Ok(Tensor::of_slice(&pixel_values).view((h as i64, w as i64)))
 }
 
-pub fn create_image_from_tensor(tensor: &Tensor) -> Result<GrayImage> {
-    // image size (W x H)
-    let w = tensor.size()[0] as usize;
-    let h = tensor.size()[1] as usize;
+/// tensor size (.. x H x W)
+pub fn convert_tensor_to_image(tensor: &Tensor) -> Result<GrayImage> {
+    let size = tensor.size();
+    let h = size[size.len() - 2] as usize;
+    let w = size[size.len() - 1] as usize;
     let mut pixel_values = vec![0; w * h];
     pixel_values.iter_mut().enumerate().for_each(|(n, val)| {
         let y = n as i64 / w as i64;
         let x = n as i64 - y * w as i64;
-        *val = tensor.int64_value(&[x, y]) as u8;
+        *val = tensor.int64_value(&[y, x]) as u8;
     });
     Ok(ImageBuffer::from_vec(w as u32, h as u32, pixel_values).unwrap())
 }
@@ -727,7 +716,7 @@ fn perpendicular_distance(line_args: (f64, f64, f64), point: (usize, usize)) -> 
     (a * x as f64 + b * y as f64 + c).abs() / (a.powf(2.) + b.powf(2.)).sqrt()
 }
 
-fn min_area_rect(contour: &[(usize, usize)]) -> Vec<(usize, usize)> {
+pub fn min_area_rect(contour: &[(usize, usize)]) -> Vec<(usize, usize)> {
     let hull = convex_hull(&contour);
     match hull.len() {
         0 => panic!("no points are defined"),
@@ -756,7 +745,7 @@ fn rotating_calipers(points: &[(usize, usize)]) -> Vec<(usize, usize)> {
     edge_angles.dedup();
 
     let mut min_area = std::f64::MAX;
-    let mut res = [(0., 0.); 4];
+    let mut res = vec![(0., 0.); 4];
     for angle in edge_angles {
         let r = [[angle.cos(), -angle.sin()], [angle.sin(), angle.cos()]];
 
@@ -780,7 +769,9 @@ fn rotating_calipers(points: &[(usize, usize)]) -> Vec<(usize, usize)> {
                 )
             },
         );
-        let area = (max_x - min_x) * (max_y - min_y);
+        let width = max_x - min_x;
+        let height = max_y - min_y;
+        let area = width * height;
         if area < min_area {
             min_area = area;
 
@@ -803,9 +794,25 @@ fn rotating_calipers(points: &[(usize, usize)]) -> Vec<(usize, usize)> {
         }
     }
 
-    res.iter()
-        .map(|(x, y)| (x.round() as usize, y.round() as usize))
-        .collect()
+    res.sort_by(|a, b| {
+        if a.0 < b.0 {
+            std::cmp::Ordering::Less
+        } else if a.0 > b.0 {
+            std::cmp::Ordering::Greater
+        } else {
+            std::cmp::Ordering::Equal
+        }
+    });
+    let i1 = if res[1].1 > res[0].1 { 0 } else { 1 };
+    let i2 = if res[3].1 > res[2].1 { 2 } else { 3 };
+    let i3 = if res[3].1 > res[2].1 { 3 } else { 2 };
+    let i4 = if res[1].1 > res[0].1 { 1 } else { 0 };
+    vec![
+        (res[i1].0.floor() as usize, res[i1].1.floor() as usize),
+        (res[i2].0.ceil() as usize, res[i2].1.floor() as usize),
+        (res[i3].0.ceil() as usize, res[i3].1.ceil() as usize),
+        (res[i4].0.floor() as usize, res[i4].1.ceil() as usize),
+    ]
 }
 
 ///
@@ -872,7 +879,7 @@ fn get_orientation(p: &(usize, usize), q: &(usize, usize), r: &(usize, usize)) -
     }
 }
 
-fn get_distance(p1: &(usize, usize), p2: &(usize, usize)) -> f64 {
+pub fn get_distance(p1: &(usize, usize), p2: &(usize, usize)) -> f64 {
     ((p1.0 as f64 - p2.0 as f64) * (p1.0 as f64 - p2.0 as f64)
         + (p1.1 as f64 - p2.1 as f64) * (p1.1 as f64 - p2.1 as f64))
         .sqrt()
@@ -977,18 +984,50 @@ mod tests {
 
     #[test]
     fn min_area_test() {
-        let mut image = GrayImage::from_pixel(300, 300, Luma([0]));
-        let white = Luma([255]);
-
-        let polygon = min_area_rect(&[(100, 20), (140, 30), (130, 60), (80, 55), (60, 25)])
-            .iter()
-            .map(|p| Point::new(p.0 as i32, p.1 as i32))
-            .collect::<Vec<Point<i32>>>();
-
-        draw_polygon_mut(&mut image, &polygon, white);
         assert_eq!(
             min_area_rect(&[(100, 20), (140, 30), (130, 60), (80, 55), (60, 25)]),
-            [(141, 24), (61, 16), (57, 53), (137, 61)]
+            [(60, 16), (141, 24), (137, 61), (57, 53)]
         )
+    }
+
+    #[test]
+    fn conversion_test() {
+        let values = vec![
+            0, 0, 0, 0, 1, //
+            0, 0, 0, 1, 1, //
+            0, 0, 1, 1, 1, //
+            0, 1, 1, 1, 1, //
+            1, 1, 1, 1, 1, //
+        ];
+        let original_tensor = Tensor::of_slice(&values).view([5, 5]);
+        let original_image = GrayImage::from_vec(5, 5, values).unwrap();
+        let converted_image = convert_tensor_to_image(&original_tensor).unwrap();
+        converted_image.save("converted.png").unwrap();
+        assert_eq!(original_image, converted_image);
+
+        let converted_tensor = convert_image_to_tensor(&original_image).unwrap();
+        assert_eq!(original_tensor, converted_tensor);
+    }
+
+    #[test]
+    fn conversion_of_different_dim_test() {
+        let values = vec![
+            0, 0, 0, 0, 1, //
+            0, 0, 0, 1, 1, //
+            0, 0, 1, 1, 1, //
+            0, 1, 1, 1, 1, //
+            1, 1, 1, 1, 1, //
+            0, 1, 1, 1, 1, //
+            0, 0, 1, 1, 1, //
+            0, 0, 0, 1, 1, //
+            0, 0, 0, 0, 1, //
+        ];
+        let original_tensor = Tensor::of_slice(&values).view([9, 5]);
+        let original_image = GrayImage::from_vec(5, 9, values).unwrap();
+        let converted_image = convert_tensor_to_image(&original_tensor).unwrap();
+        assert_eq!(original_image, converted_image);
+
+        let converted_tensor = convert_image_to_tensor(&original_image).unwrap();
+        assert_eq!(original_tensor, converted_tensor);
     }
 }
