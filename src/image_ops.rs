@@ -25,9 +25,11 @@ pub const TEXT_DET_IMAGES_PATH: &str = "text-detection-images/totaltext";
 pub const TEXT_DET_TRAIN_IMAGES_FILE: &str = "training_images_data_text_det";
 pub const TEXT_DET_TRAIN_GT_FILE: &str = "training_gt_data_text_det";
 pub const TEXT_DET_TRAIN_MASK_FILE: &str = "training_mask_data_text_det";
+pub const TEXT_DET_TRAIN_ADJ_FILE: &str = "training_adj_data_text_det";
 pub const TEXT_DET_TEST_IMAGES_FILE: &str = "test_images_data_text_det";
 pub const TEXT_DET_TEST_GT_FILE: &str = "test_gt_data_text_det";
 pub const TEXT_DET_TEST_MASK_FILE: &str = "test_mask_data_text_det";
+pub const TEXT_DET_TEST_ADJ_FILE: &str = "test_adj_data_text_det";
 const DEFAULT_WIDTH: u32 = 800;
 const DEFAULT_HEIGHT: u32 = 800;
 const WHITE_COLOR: Luma<u8> = Luma([255]);
@@ -181,26 +183,27 @@ fn load_labels(dir_path: &str) -> Result<Tensor> {
     Err(anyhow!("Could not open dir {}", dir_path))
 }
 
-pub fn preprocess_image(file_path: &str) -> Result<(GrayImage, f64, f64)> {
+pub fn preprocess_image(file_path: &str, target_dim: (u32, u32)) -> Result<(GrayImage, f64, f64)> {
+    let (width, height) = target_dim;
     let instant = Instant::now();
     let rgba_image = open(file_path)?.into_rgba();
     let original_width = rgba_image.width();
     let original_height = rgba_image.height();
     let dyn_image = DynamicImage::ImageRgba8(rgba_image)
-        .resize(DEFAULT_WIDTH, DEFAULT_HEIGHT, FilterType::Triangle)
+        .resize(width, height, FilterType::Triangle)
         .to_luma();
 
     // correction for pixel coords
     let adjust_x = dyn_image.width() as f64 / original_width as f64;
     let adjust_y = dyn_image.height() as f64 / original_height as f64;
 
-    let mut pixel_values = vec![0; (DEFAULT_WIDTH * DEFAULT_HEIGHT) as usize];
+    let mut pixel_values = vec![0; (width * height) as usize];
     pixel_values
         .par_iter_mut()
         .enumerate()
         .for_each(|(n, val)| {
-            let y = n as u32 / DEFAULT_WIDTH;
-            let x = n as u32 - y * DEFAULT_WIDTH;
+            let y = n as u32 / width;
+            let x = n as u32 - y * width;
             if x < dyn_image.width() && y < dyn_image.height() {
                 *val = dyn_image.get_pixel(x, y).0[0];
             }
@@ -210,7 +213,7 @@ pub fn preprocess_image(file_path: &str) -> Result<(GrayImage, f64, f64)> {
         instant.elapsed().as_nanos()
     );
     Ok((
-        ImageBuffer::from_vec(DEFAULT_WIDTH, DEFAULT_HEIGHT, pixel_values).unwrap(),
+        ImageBuffer::from_vec(width, height, pixel_values).unwrap(),
         adjust_x,
         adjust_y,
     ))
@@ -220,9 +223,11 @@ fn generate_gt_and_mask_images(
     polygons: &[Tensor],
     adjust_x: f64,
     adjust_y: f64,
+    target_dim: (u32, u32),
 ) -> Result<(GrayImage, GrayImage, Vec<bool>)> {
-    let mut gt_image = GrayImage::new(DEFAULT_WIDTH, DEFAULT_HEIGHT);
-    let mut mask_temp = DynamicImage::new_luma8(DEFAULT_WIDTH, DEFAULT_HEIGHT);
+    let (width, height) = target_dim;
+    let mut gt_image = GrayImage::new(width, height);
+    let mut mask_temp = DynamicImage::new_luma8(width, height);
     let mut ignore_flags = vec![false; polygons.len()];
     mask_temp.invert();
     let mut mask_image = mask_temp.to_luma();
@@ -282,9 +287,12 @@ fn load_polygons(file_path: &str) -> Result<Vec<Tensor>> {
     Ok(polygons)
 }
 
-pub fn load_text_detection_image(file_path: &str) -> Result<(Tensor, Tensor, Tensor)> {
+pub fn load_text_detection_image(
+    file_path: &str,
+    target_dim: (u32, u32),
+) -> Result<(Tensor, Tensor, Tensor, Tensor)> {
     let instant = Instant::now();
-    let (preprocessed_image, adjust_x, adjust_y) = preprocess_image(file_path)?;
+    let (preprocessed_image, adjust_x, adjust_y) = preprocess_image(file_path, target_dim)?;
 
     let path_parts = file_path.split_terminator('/').collect::<Vec<&str>>();
     let last_idx = path_parts.len() - 1;
@@ -296,17 +304,19 @@ pub fn load_text_detection_image(file_path: &str) -> Result<(Tensor, Tensor, Ten
     ))?;
 
     let (gt_image, mask_image, _ignore_flags) =
-        generate_gt_and_mask_images(&polygons, adjust_x, adjust_y)?;
+        generate_gt_and_mask_images(&polygons, adjust_x, adjust_y, target_dim)?;
+
     let image_tensor = convert_image_to_tensor(&preprocessed_image)?.to_kind(Kind::Uint8);
     let gt_tensor = (convert_image_to_tensor(&gt_image)? / 255.).to_kind(Kind::Uint8);
     let mask_tensor = (convert_image_to_tensor(&mask_image)? / 255.).to_kind(Kind::Uint8);
+    let adjust_tensor = Tensor::of_slice(&[adjust_x, adjust_y]).view((1, 2));
 
     trace!(
         "finished loading and preparing text detection images in {:?} ns",
         instant.elapsed().as_nanos()
     );
 
-    Ok((image_tensor, gt_tensor, mask_tensor))
+    Ok((image_tensor, gt_tensor, mask_tensor, adjust_tensor))
 }
 
 /// image size (w, h)
@@ -326,9 +336,12 @@ pub fn convert_image_to_tensor(image: &GrayImage) -> Result<Tensor> {
     Ok(Tensor::of_slice(&pixel_values).view((h as i64, w as i64)))
 }
 
-/// tensor size (.. x H x W)
+/// tensor size (H x W)
 pub fn convert_tensor_to_image(tensor: &Tensor) -> Result<GrayImage> {
     let size = tensor.size();
+    if size.len() > 2 {
+        return Err(anyhow!("tensor must be in 2 dimensions"));
+    }
     let h = size[size.len() - 2] as usize;
     let w = size[size.len() - 1] as usize;
     let mut pixel_values = vec![0; w * h];
@@ -345,25 +358,31 @@ pub fn load_text_detection_tensor_files(target_dir: &str) -> Result<TextDetectio
         let mut train_images = Vec::new();
         let mut train_gt = Vec::new();
         let mut train_mask = Vec::new();
+        let mut train_adj = Vec::new();
         let mut test_images = Vec::new();
         let mut test_gt = Vec::new();
         let mut test_mask = Vec::new();
+        let mut test_adj = Vec::new();
         files.for_each(|f| {
             let file = f.unwrap();
             let filename = file.file_name().into_string().unwrap();
             let path = file.path().display().to_string();
-            if filename.starts_with(TEXT_DET_TRAIN_IMAGES_FILE) {
+            if filename.starts_with(&get_target_filename(TEXT_DET_TRAIN_IMAGES_FILE)) {
                 train_images.push(path);
-            } else if filename.starts_with(TEXT_DET_TRAIN_GT_FILE) {
+            } else if filename.starts_with(&get_target_filename(TEXT_DET_TRAIN_GT_FILE)) {
                 train_gt.push(path);
-            } else if filename.starts_with(TEXT_DET_TRAIN_MASK_FILE) {
+            } else if filename.starts_with(&get_target_filename(TEXT_DET_TRAIN_MASK_FILE)) {
                 train_mask.push(path);
-            } else if filename.starts_with(TEXT_DET_TEST_IMAGES_FILE) {
+            } else if filename.starts_with(&get_target_filename(TEXT_DET_TRAIN_ADJ_FILE)) {
+                train_adj.push(path);
+            } else if filename.starts_with(&get_target_filename(TEXT_DET_TEST_IMAGES_FILE)) {
                 test_images.push(path);
-            } else if filename.starts_with(TEXT_DET_TEST_GT_FILE) {
+            } else if filename.starts_with(&get_target_filename(TEXT_DET_TEST_GT_FILE)) {
                 test_gt.push(path);
-            } else if filename.starts_with(TEXT_DET_TEST_MASK_FILE) {
+            } else if filename.starts_with(&get_target_filename(TEXT_DET_TEST_MASK_FILE)) {
                 test_mask.push(path);
+            } else if filename.starts_with(&get_target_filename(TEXT_DET_TEST_ADJ_FILE)) {
+                test_adj.push(path);
             }
         });
         if train_images.len() != train_gt.len() || train_images.len() != train_mask.len() {
@@ -398,23 +417,31 @@ pub fn load_text_detection_tensor_files(target_dir: &str) -> Result<TextDetectio
     }
 }
 
-pub fn generate_text_det_tensor_chunks(images_base_dir: &str, train: bool) -> Result<()> {
+pub fn generate_text_det_tensor_chunks(
+    images_base_dir: &str,
+    train: bool,
+    target_dim: Option<(u32, u32)>,
+) -> Result<()> {
     let instant = Instant::now();
+    let dim = target_dim.unwrap_or((DEFAULT_WIDTH, DEFAULT_HEIGHT));
     let images_file;
     let gt_file;
     let mask_file;
+    let adj_file;
     let window_size;
     let target_dir;
     if train {
-        images_file = TEXT_DET_TRAIN_IMAGES_FILE;
-        gt_file = TEXT_DET_TRAIN_GT_FILE;
-        mask_file = TEXT_DET_TRAIN_MASK_FILE;
+        images_file = get_target_filename(TEXT_DET_TRAIN_IMAGES_FILE);
+        gt_file = get_target_filename(TEXT_DET_TRAIN_GT_FILE);
+        mask_file = get_target_filename(TEXT_DET_TRAIN_MASK_FILE);
+        adj_file = get_target_filename(TEXT_DET_TRAIN_ADJ_FILE);
         window_size = 40;
         target_dir = "train";
     } else {
-        images_file = TEXT_DET_TEST_IMAGES_FILE;
-        gt_file = TEXT_DET_TEST_GT_FILE;
-        mask_file = TEXT_DET_TEST_MASK_FILE;
+        images_file = get_target_filename(TEXT_DET_TEST_IMAGES_FILE);
+        gt_file = get_target_filename(TEXT_DET_TEST_GT_FILE);
+        mask_file = get_target_filename(TEXT_DET_TEST_MASK_FILE);
+        adj_file = get_target_filename(TEXT_DET_TEST_ADJ_FILE);
         window_size = 10;
         target_dir = "test";
     };
@@ -429,7 +456,7 @@ pub fn generate_text_det_tensor_chunks(images_base_dir: &str, train: bool) -> Re
             .chunks(window_size)
             .enumerate()
             .for_each(|(pos, chunk)| {
-                let (images, gts, masks) = chunk
+                let (images, gts, masks, adjust_values) = chunk
                     .par_iter()
                     .fold(
                         || {
@@ -437,25 +464,27 @@ pub fn generate_text_det_tensor_chunks(images_base_dir: &str, train: bool) -> Re
                                 Tensor::of_slice(&[0]),
                                 Tensor::of_slice(&[0]),
                                 Tensor::of_slice(&[0]),
+                                Tensor::new(),
                             )
                         },
-                        |(mut im_acc, mut gt_acc, mut mask_acc), filename| {
+                        |(mut im_acc, mut gt_acc, mut mask_acc, mut adjust_acc), filename| {
                             if TEXT_DET_FILE_NAME_FORMAT_REGEX.captures(filename).is_some() {
-                                match load_text_detection_image(filename) {
-                                    Ok((im, gt, mask)) => {
+                                match load_text_detection_image(filename, dim) {
+                                    Ok((im, gt, mask, adj_values)) => {
                                         if im_acc.numel() == 1 {
-                                            return (im, gt, mask);
+                                            return (im, gt, mask, adj_values);
                                         }
                                         im_acc = Tensor::cat(&[im_acc, im], 0);
                                         gt_acc = Tensor::cat(&[gt_acc, gt], 0);
                                         mask_acc = Tensor::cat(&[mask_acc, mask], 0);
+                                        adjust_acc = Tensor::cat(&[adjust_acc, adj_values], 0);
                                     }
                                     Err(msg) => {
                                         error!("Error while loading single image data: {}", msg);
                                     }
                                 }
                             }
-                            (im_acc, gt_acc, mask_acc)
+                            (im_acc, gt_acc, mask_acc, adjust_acc)
                         },
                     )
                     .reduce(
@@ -464,36 +493,45 @@ pub fn generate_text_det_tensor_chunks(images_base_dir: &str, train: bool) -> Re
                                 Tensor::of_slice(&[0]),
                                 Tensor::of_slice(&[0]),
                                 Tensor::of_slice(&[0]),
+                                Tensor::new(),
                             )
                         },
-                        |(im_acc, gt_acc, mask_acc), (part_im, part_gt, part_mask)| {
+                        |(im_acc, gt_acc, mask_acc, adj_acc),
+                         (part_im, part_gt, part_mask, part_adj)| {
                             if im_acc.numel() == 1 {
-                                return (part_im, part_gt, part_mask);
+                                return (part_im, part_gt, part_mask, part_adj);
                             }
                             (
                                 Tensor::cat(&[im_acc, part_im], 0),
                                 Tensor::cat(&[gt_acc, part_gt], 0),
                                 Tensor::cat(&[mask_acc, part_mask], 0),
+                                Tensor::cat(&[adj_acc, part_adj], 0),
                             )
                         },
                     );
                 let mut save_res = images
-                    .view((-1, DEFAULT_WIDTH as i64, DEFAULT_HEIGHT as i64))
+                    .view((-1, dim.0 as i64, dim.1 as i64))
                     .save(format!("{}.{}", images_file, pos));
                 if let Err(msg) = save_res {
                     error!("Error while saving image tensor {}", msg);
                 }
                 save_res = gts
-                    .view((-1, DEFAULT_WIDTH as i64, DEFAULT_HEIGHT as i64))
+                    .view((-1, dim.0 as i64, dim.1 as i64))
                     .save(format!("{}.{}", gt_file, pos));
                 if let Err(msg) = save_res {
                     error!("Error while saving gt tensor {}", msg);
                 }
                 save_res = masks
-                    .view((-1, DEFAULT_WIDTH as i64, DEFAULT_HEIGHT as i64))
+                    .view((-1, dim.0 as i64, dim.1 as i64))
                     .save(format!("{}.{}", mask_file, pos));
                 if let Err(msg) = save_res {
                     error!("Error while saving mask tensor {}", msg);
+                }
+                save_res = adjust_values
+                    .view((-1, 2))
+                    .save(format!("{}.{}", adj_file, pos));
+                if let Err(msg) = save_res {
+                    error!("Error while saving adj tensor {}", msg);
                 }
             });
         trace!(
@@ -815,6 +853,18 @@ fn rotating_calipers(points: &[(usize, usize)]) -> Vec<(usize, usize)> {
     ]
 }
 
+#[cfg(test)]
+fn get_target_filename(name: &str) -> String {
+    let mut s = String::from("test-");
+    s.push_str(name);
+    s
+}
+
+#[cfg(not(test))]
+fn get_target_filename(name: &str) -> String {
+    String::from(name)
+}
+
 ///
 /// Finds points of the smallest convex polygon that contains all the contour points.
 /// https://en.wikipedia.org/wiki/Graham_scan
@@ -895,8 +945,8 @@ mod tests {
     #[test]
     fn tensor_cat() {
         let device = Device::cuda_if_available();
-        let zeros = Tensor::zeros(&[2, 3], (Kind::Float, device));
-        let ones = Tensor::ones(&[2, 3], (Kind::Float, device));
+        let zeros = Tensor::zeros(&[2, 3], (Kind::Double, device));
+        let ones = Tensor::ones(&[2, 3], (Kind::Double, device));
         assert_eq!(
             Tensor::cat(&[zeros, ones], 0).view((-1, 2, 3)),
             Tensor::of_slice(&[0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 1, 1]).view((2, 2, 3))
@@ -904,10 +954,11 @@ mod tests {
     }
 
     #[test]
-    fn find_contours_test() {
-        let image = open("polygon.png").unwrap().to_luma();
-        let contours = find_contours(&image).unwrap();
+    fn find_contours_test() -> Result<()> {
+        let image = open("test_data/polygon.png")?.to_luma();
+        let contours = find_contours(&image)?;
         assert_eq!(contours.len(), 6);
+        Ok(())
     }
 
     #[test]
@@ -925,7 +976,7 @@ mod tests {
     }
 
     #[test]
-    fn get_contours_approx_points() {
+    fn get_contours_approx_points() -> Result<()> {
         let mut image = GrayImage::from_pixel(300, 300, Luma([0]));
         let white = Luma([255]);
 
@@ -942,7 +993,7 @@ mod tests {
             Point::new(90, 35),
         ];
         draw_polygon_mut(&mut image, &star, white);
-        let contours = find_contours(&image).unwrap();
+        let contours = find_contours(&image)?;
         let c1_approx = approx_poly_dp(&contours[0], arc_lenght(&contours[0], true) * 0.01, true);
         assert_eq!(
             c1_approx,
@@ -959,6 +1010,7 @@ mod tests {
                 (120, 35)
             ]
         );
+        Ok(())
     }
 
     #[test]
@@ -991,7 +1043,7 @@ mod tests {
     }
 
     #[test]
-    fn conversion_test() {
+    fn conversion_5x5_test() -> Result<()> {
         let values = vec![
             0, 0, 0, 0, 1, //
             0, 0, 0, 1, 1, //
@@ -1001,16 +1053,16 @@ mod tests {
         ];
         let original_tensor = Tensor::of_slice(&values).view([5, 5]);
         let original_image = GrayImage::from_vec(5, 5, values).unwrap();
-        let converted_image = convert_tensor_to_image(&original_tensor).unwrap();
-        converted_image.save("converted.png").unwrap();
+        let converted_image = convert_tensor_to_image(&original_tensor)?;
         assert_eq!(original_image, converted_image);
 
-        let converted_tensor = convert_image_to_tensor(&original_image).unwrap();
+        let converted_tensor = convert_image_to_tensor(&original_image)?;
         assert_eq!(original_tensor, converted_tensor);
+        Ok(())
     }
 
     #[test]
-    fn conversion_of_different_dim_test() {
+    fn conversion_of_different_dim_test() -> Result<()> {
         let values = vec![
             0, 0, 0, 0, 1, //
             0, 0, 0, 1, 1, //
@@ -1024,10 +1076,158 @@ mod tests {
         ];
         let original_tensor = Tensor::of_slice(&values).view([9, 5]);
         let original_image = GrayImage::from_vec(5, 9, values).unwrap();
-        let converted_image = convert_tensor_to_image(&original_tensor).unwrap();
+        let converted_image = convert_tensor_to_image(&original_tensor)?;
         assert_eq!(original_image, converted_image);
 
-        let converted_tensor = convert_image_to_tensor(&original_image).unwrap();
+        let converted_tensor = convert_image_to_tensor(&original_image)?;
         assert_eq!(original_tensor, converted_tensor);
+        Ok(())
+    }
+
+    #[test]
+    fn tensor_generating_tests() -> Result<()> {
+        // generate tensors
+        generate_text_det_tensor_chunks("test_data/text_det", true, None)?;
+        generate_text_det_tensor_chunks("test_data/text_det", false, None)?;
+
+        // load expected images
+        let train_img1 = open("test_data/preprocessed_img55.png")?.to_luma();
+        let train_img2 = open("test_data/preprocessed_img224.png")?.to_luma();
+        let train_gt_img1 = open("test_data/gt_img55.png")?.to_luma();
+        let train_gt_img2 = open("test_data/gt_img224.png")?.to_luma();
+        let train_mask_img1 = open("test_data/mask_img55.png")?.to_luma();
+        let train_mask_img2 = open("test_data/mask_img224.png")?.to_luma();
+        let test_img1 = open("test_data/preprocessed_img494.png")?.to_luma();
+        let test_img2 = open("test_data/preprocessed_img545.png")?.to_luma();
+        let test_gt_img1 = open("test_data/gt_img494.png")?.to_luma();
+        let test_gt_img2 = open("test_data/gt_img545.png")?.to_luma();
+        let test_mask_img1 = open("test_data/mask_img494.png")?.to_luma();
+        let test_mask_img2 = open("test_data/mask_img545.png")?.to_luma();
+
+        // assert generated values
+        let filenames: Vec<String> = [
+            TEXT_DET_TRAIN_IMAGES_FILE,
+            TEXT_DET_TRAIN_GT_FILE,
+            TEXT_DET_TRAIN_MASK_FILE,
+            TEXT_DET_TRAIN_ADJ_FILE,
+            TEXT_DET_TEST_IMAGES_FILE,
+            TEXT_DET_TEST_GT_FILE,
+            TEXT_DET_TEST_MASK_FILE,
+            TEXT_DET_TEST_ADJ_FILE,
+        ]
+        .iter()
+        .map(|&x| {
+            let mut s = get_target_filename(x);
+            s.push_str(".0");
+            s
+        })
+        .collect();
+
+        let train_images_tensor = Tensor::load(&filenames[0])?;
+        assert_eq!(train_images_tensor.size(), [2, 800, 800]);
+        assert_eq!(
+            train_images_tensor.get(0).to_kind(Kind::Double),
+            convert_image_to_tensor(&train_img1)?
+        );
+        assert_eq!(
+            train_images_tensor.get(1).to_kind(Kind::Double),
+            convert_image_to_tensor(&train_img2)?
+        );
+
+        let train_gts_tensor = Tensor::load(&filenames[1])?;
+        assert_eq!(train_gts_tensor.size(), [2, 800, 800]);
+        assert_eq!(
+            train_gts_tensor.get(0).to_kind(Kind::Double),
+            convert_image_to_tensor(&train_gt_img1)? / 255.
+        );
+        assert_eq!(
+            train_gts_tensor.get(1).to_kind(Kind::Double),
+            convert_image_to_tensor(&train_gt_img2)? / 255.
+        );
+
+        let train_masks_tensor = Tensor::load(&filenames[2])?;
+        assert_eq!(train_masks_tensor.size(), [2, 800, 800]);
+        assert_eq!(
+            train_masks_tensor.get(0).to_kind(Kind::Double),
+            convert_image_to_tensor(&train_mask_img1)? / 255.
+        );
+        assert_eq!(
+            train_masks_tensor.get(1).to_kind(Kind::Double),
+            convert_image_to_tensor(&train_mask_img2)? / 255.
+        );
+
+        let train_adj_tensor = Tensor::load(&filenames[3])?;
+        assert_eq!(train_adj_tensor.size(), [2, 2]);
+
+        let mut original_dim = (300., 200.);
+        let mut resized = (800., 533.);
+        assert_eq!(
+            train_adj_tensor.get(0),
+            Tensor::of_slice(&[resized.0 / original_dim.0, resized.1 / original_dim.1])
+        );
+
+        original_dim = (180., 240.);
+        resized = (600., 800.);
+        assert_eq!(
+            train_adj_tensor.get(1),
+            Tensor::of_slice(&[resized.0 / original_dim.0, resized.1 / original_dim.1])
+        );
+
+        let test_images_tensor = Tensor::load(&filenames[4])?;
+        assert_eq!(test_images_tensor.size(), [2, 800, 800]);
+        assert_eq!(
+            test_images_tensor.get(0).to_kind(Kind::Double),
+            convert_image_to_tensor(&test_img1)?
+        );
+        assert_eq!(
+            test_images_tensor.get(1).to_kind(Kind::Double),
+            convert_image_to_tensor(&test_img2)?
+        );
+
+        let test_gts_tensor = Tensor::load(&filenames[5])?;
+        assert_eq!(test_gts_tensor.size(), [2, 800, 800]);
+        assert_eq!(
+            test_gts_tensor.get(0).to_kind(Kind::Double),
+            convert_image_to_tensor(&test_gt_img1)? / 255.
+        );
+        assert_eq!(
+            test_gts_tensor.get(1).to_kind(Kind::Double),
+            convert_image_to_tensor(&test_gt_img2)? / 255.
+        );
+
+        let test_masks_tensor = Tensor::load(&filenames[6])?;
+        assert_eq!(test_masks_tensor.size(), [2, 800, 800]);
+        assert_eq!(
+            test_masks_tensor.get(0).to_kind(Kind::Double),
+            convert_image_to_tensor(&test_mask_img1)? / 255.
+        );
+        assert_eq!(
+            test_masks_tensor.get(1).to_kind(Kind::Double),
+            convert_image_to_tensor(&test_mask_img2)? / 255.
+        );
+
+        let test_adj_tensor = Tensor::load(&filenames[7])?;
+        assert_eq!(test_adj_tensor.size(), [2, 2]);
+
+        original_dim = (200., 200.);
+        resized = (800., 800.);
+        assert_eq!(
+            test_adj_tensor.get(0),
+            Tensor::of_slice(&[resized.0 / original_dim.0, resized.1 / original_dim.1])
+        );
+
+        original_dim = (184., 274.);
+        resized = (537., 800.);
+        assert_eq!(
+            test_adj_tensor.get(1),
+            Tensor::of_slice(&[resized.0 / original_dim.0, resized.1 / original_dim.1])
+        );
+
+        // cleanup generated files
+        for f in filenames {
+            fs::remove_file(&f)?;
+        }
+
+        Ok(())
     }
 }

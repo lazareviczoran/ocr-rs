@@ -82,7 +82,9 @@ pub fn run_prediction(image_tensor: &Tensor) -> Result<()> {
 
   // recognize character
   let instant = Instant::now();
-  let res = net.forward_t(&image_tensor, false).softmax(-1, Kind::Float);
+  let res = net
+    .forward_t(&image_tensor, false)
+    .softmax(-1, Kind::Double);
   let (predicted_value, probability) = utils::topk(&res, 1)[0];
 
   debug!(
