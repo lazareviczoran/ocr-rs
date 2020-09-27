@@ -385,7 +385,10 @@ pub fn load_text_detection_tensor_files(target_dir: &str) -> Result<TextDetectio
                 test_adj.push(path);
             }
         });
-        if train_images.len() != train_gt.len() || train_images.len() != train_mask.len() {
+        if train_images.len() != train_gt.len()
+            || train_images.len() != train_mask.len()
+            || train_images.len() != train_adj.len()
+        {
             return Err(
                 anyhow!(
                     "training tensors number doesn't match: images tensors {} - gt tensors {} - mask tensors {}",
@@ -394,7 +397,10 @@ pub fn load_text_detection_tensor_files(target_dir: &str) -> Result<TextDetectio
                     train_mask.len()
                 )
             );
-        } else if test_images.len() != test_gt.len() || test_images.len() != test_mask.len() {
+        } else if test_images.len() != test_gt.len()
+            || test_images.len() != test_mask.len()
+            || test_images.len() != test_adj.len()
+        {
             return Err(
                 anyhow!(
                     "test tensors number doesn't match: images tensors {} - gt tensors {} - mask tensors {}",
@@ -408,9 +414,11 @@ pub fn load_text_detection_tensor_files(target_dir: &str) -> Result<TextDetectio
             train_images,
             train_gt,
             train_mask,
+            train_adj,
             test_images,
             test_gt,
             test_mask,
+            test_adj,
         })
     } else {
         Err(anyhow!("The directory doesn't exist"))
