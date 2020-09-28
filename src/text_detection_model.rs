@@ -341,3 +341,174 @@ fn box_score_fast(bitmap: &Tensor, points: &[(usize, usize)]) -> Result<f64> {
 
     Ok(mean.double_value(&[]))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::image_ops::convert_image_to_tensor;
+    use super::*;
+    use image::open;
+    use imageproc::drawing::draw_polygon_mut;
+    const ERROR_THRESHOLD: f64 = 1e-10;
+
+    #[test]
+    fn get_mini_area_bounding_box_test() {
+        let res = get_mini_area_bounding_box(&[(141, 24), (61, 16), (57, 53), (137, 61)]);
+        assert_eq!(res.0, vec![(60, 15), (142, 23), (138, 62), (57, 54)]);
+        assert!(res.1 - 39.11521443121589 < ERROR_THRESHOLD);
+    }
+
+    #[test]
+    fn box_score_with_whole_matrix_test() {
+        let values = vec![
+            0, 0, 0, 1, 0, //
+            0, 0, 1, 1, 0, //
+            0, 1, 1, 1, 0, //
+            0, 1, 1, 0, 0, //
+            0, 1, 1, 0, 0, //
+        ];
+        let pred = Tensor::of_slice(&values).view([5, 5]);
+        let points = vec![(0, 0), (4, 0), (4, 4), (0, 4)];
+        assert_eq!(box_score_fast(&pred, &points).unwrap(), 10. / 25.);
+    }
+
+    #[test]
+    fn box_score_partial_matrix_test() {
+        let values = vec![
+            0, 0, 0, 1, 0, //
+            0, 0, 1, 1, 0, //
+            0, 1, 1, 1, 0, //
+            0, 1, 1, 0, 0, //
+            0, 1, 1, 0, 0, //
+        ];
+        let pred = Tensor::of_slice(&values).view([5, 5]);
+        let points = vec![(1, 0), (4, 0), (4, 3), (1, 3)];
+        assert_eq!(box_score_fast(&pred, &points).unwrap(), 8. / 16.);
+    }
+
+    #[test]
+    fn box_score_partial_matrix_test_2() {
+        let values = vec![
+            0, 0, 0, 1, 0, //
+            0, 0, 1, 1, 0, //
+            0, 1, 1, 1, 0, //
+            0, 1, 1, 0, 0, //
+            0, 1, 1, 0, 0, //
+        ];
+        let pred = Tensor::of_slice(&values).view([5, 5]);
+        let points = vec![(2, 0), (4, 1), (2, 4), (1, 3)];
+        assert_eq!(box_score_fast(&pred, &points).unwrap(), 9. / 12.);
+    }
+
+    #[test]
+    fn binarize_test() -> Result<()> {
+        let values = vec![
+            0.01, 0.2, 0.57, 0.58, 0.18, //
+            0.39, 0.01, 0.61, 1.0, 0.42, //
+            0.4, 0.94, 0.835, 0.793, 0.32, //
+            0.57, 0.77, 0.62, 0.51, 0.29, //
+            0.11, 0.69, 0.59, 0.21, 0.35, //
+        ];
+        let pred = Tensor::of_slice(&values).view([5, 5]);
+        assert_eq!(
+            binarize(&pred, 0.57)?,
+            Tensor::of_slice(&[
+                0, 0, 0, 1, 0, //
+                0, 0, 1, 1, 0, //
+                0, 1, 1, 1, 0, //
+                0, 1, 1, 0, 0, //
+                0, 1, 1, 0, 0, //
+            ])
+            .view((5, 5))
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn get_boxes_from_bitmap_test() -> Result<()> {
+        let polygons_image = open("test_data/polygon.png")?.to_luma();
+        let h = polygons_image.height() as i64;
+        let w = polygons_image.width() as i64;
+        let bit_tensor = convert_image_to_tensor(&polygons_image)?;
+        let bitmap_tensor = (&bit_tensor / 255.).to_kind(Kind::Uint8).view((1, h, w));
+
+        // perfect match
+        let mut prediction_image = GrayImage::new(w as u32, h as u32);
+        draw_polygon_mut(
+            &mut prediction_image,
+            &[
+                Point::new(60, 16),
+                Point::new(141, 24),
+                Point::new(137, 61),
+                Point::new(57, 53),
+            ],
+            WHITE_COLOR,
+        );
+        draw_polygon_mut(
+            &mut prediction_image,
+            &[
+                Point::new(235, 17),
+                Point::new(302, 21),
+                Point::new(299, 59),
+                Point::new(233, 54),
+            ],
+            WHITE_COLOR,
+        );
+        draw_polygon_mut(
+            &mut prediction_image,
+            &[
+                Point::new(7, 75),
+                Point::new(148, 95),
+                Point::new(145, 111),
+                Point::new(4, 91),
+            ],
+            WHITE_COLOR,
+        );
+        draw_polygon_mut(
+            &mut prediction_image,
+            &[
+                Point::new(250, 79),
+                Point::new(303, 85),
+                Point::new(299, 126),
+                Point::new(245, 120),
+            ],
+            WHITE_COLOR,
+        );
+        draw_polygon_mut(
+            &mut prediction_image,
+            &[
+                Point::new(25, 181),
+                Point::new(125, 181),
+                Point::new(125, 268),
+                Point::new(25, 268),
+            ],
+            WHITE_COLOR,
+        );
+        draw_polygon_mut(
+            &mut prediction_image,
+            &[
+                Point::new(190, 250),
+                Point::new(255, 185),
+                Point::new(285, 215),
+                Point::new(220, 280),
+            ],
+            WHITE_COLOR,
+        );
+        let pred_tensor = (convert_image_to_tensor(&prediction_image)? / 255.).view((1, h, w));
+        let adjust_values = Tensor::of_slice(&[2., 2.]).view((1, 2));
+        let expected_boxes = vec![
+            // expected boxes are reajdusted to the original image size (divided by adjust values)
+            Tensor::of_slice(&[30i16, 8, 71, 12, 69, 31, 29, 27]).view((4, 2)),
+            Tensor::of_slice(&[118i16, 9, 151, 11, 150, 30, 117, 27]).view((4, 2)),
+            Tensor::of_slice(&[4i16, 38, 74, 48, 73, 56, 2, 46]).view((4, 2)),
+            Tensor::of_slice(&[125i16, 40, 152, 43, 150, 63, 123, 60]).view((4, 2)),
+            Tensor::of_slice(&[13i16, 91, 63, 91, 63, 134, 13, 134]).view((4, 2)),
+            Tensor::of_slice(&[95i16, 125, 128, 93, 143, 108, 110, 140]).view((4, 2)),
+        ];
+        let expected_scores = Tensor::ones(&[6], (Kind::Double, Device::cuda_if_available()));
+        assert_eq!(
+            get_boxes_from_bitmap(&pred_tensor, &bitmap_tensor, &adjust_values)?,
+            (expected_boxes, expected_scores)
+        );
+        Ok(())
+    }
+}
