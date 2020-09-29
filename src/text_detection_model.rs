@@ -276,7 +276,7 @@ fn get_boxes_from_bitmap(
 
     for i in 0..num_contours {
         let contour = &contours[i];
-        boxes.push(Tensor::new());
+        boxes.push(Tensor::of_slice(&[0]));
         let (points, sside) = get_mini_area_bounding_box(contour);
         if sside < min_size {
             continue;
@@ -424,7 +424,7 @@ mod tests {
     }
 
     #[test]
-    fn get_boxes_from_bitmap_test() -> Result<()> {
+    fn get_boxes_from_bitmap_test_perfect_match_with_2x_adjustments() -> Result<()> {
         let polygons_image = open("test_data/polygon.png")?.to_luma();
         let h = polygons_image.height() as i64;
         let w = polygons_image.width() as i64;
@@ -494,6 +494,8 @@ mod tests {
             WHITE_COLOR,
         );
         let pred_tensor = (convert_image_to_tensor(&prediction_image)? / 255.).view((1, h, w));
+
+        // 2x adjustment
         let adjust_values = Tensor::of_slice(&[2., 2.]).view((1, 2));
         let expected_boxes = vec![
             // expected boxes are reajdusted to the original image size (divided by adjust values)
@@ -505,6 +507,35 @@ mod tests {
             Tensor::of_slice(&[95i16, 125, 128, 93, 143, 108, 110, 140]).view((4, 2)),
         ];
         let expected_scores = Tensor::ones(&[6], (Kind::Double, Device::cuda_if_available()));
+        assert_eq!(
+            get_boxes_from_bitmap(&pred_tensor, &bitmap_tensor, &adjust_values)?,
+            (expected_boxes, expected_scores)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn get_boxes_from_bitmap_test_partial_match_with_no_adjustments() -> Result<()> {
+        let polygons_image = open("test_data/polygon.png")?.to_luma();
+        let h = polygons_image.height() as i64;
+        let w = polygons_image.width() as i64;
+        let bit_tensor = convert_image_to_tensor(&polygons_image)?;
+        let bitmap_tensor = (&bit_tensor / 255.).to_kind(Kind::Uint8).view((1, h, w));
+
+        let pred_tensor = (convert_image_to_tensor(&polygons_image)? / 255.).view((1, h, w));
+        // no adjustment
+        let adjust_values = Tensor::of_slice(&[1., 1.]).view((1, 2));
+        let expected_boxes = vec![
+            // expected boxes with score over thresh (0.7) should appear
+            Tensor::of_slice(&[0]),
+            Tensor::of_slice(&[0]),
+            Tensor::of_slice(&[0]),
+            Tensor::of_slice(&[250, 79, 303, 85, 299, 126, 245, 120]).view((4, 2)),
+            Tensor::of_slice(&[25, 181, 125, 181, 125, 268, 25, 268]).view((4, 2)),
+            Tensor::of_slice(&[0]),
+        ];
+        let expected_scores =
+            Tensor::of_slice(&[0., 0., 0., 0.703405017921147, 0.7521377137713772, 0.]);
         assert_eq!(
             get_boxes_from_bitmap(&pred_tensor, &bitmap_tensor, &adjust_values)?,
             (expected_boxes, expected_scores)
