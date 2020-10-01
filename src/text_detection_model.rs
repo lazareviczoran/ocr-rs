@@ -1,6 +1,9 @@
 use super::dataset::TextDetectionDataset;
 use super::image_ops;
-use anyhow::Result;
+use anyhow::{anyhow, Result};
+use geo::prelude::*;
+use geo::{LineString, Polygon};
+use geo_booleanop::boolean::BooleanOp;
 use image::math::utils::clamp;
 use image::{GrayImage, Luma};
 use imageproc::drawing::{self, Point};
@@ -152,7 +155,7 @@ pub fn resnet18(p: &nn::Path) -> FuncT<'static> {
     resnet(p, 2, 2, 2, 2)
 }
 
-fn create_and_train_model() -> Result<FuncT<'static>> {
+pub fn create_and_train_model() -> Result<FuncT<'static>> {
     let dataset_paths = image_ops::load_text_detection_tensor_files("./")?;
 
     let vs = nn::VarStore::new(Device::cuda_if_available());
@@ -168,7 +171,7 @@ fn create_and_train_model() -> Result<FuncT<'static>> {
             let loss = calculate_balance_loss(pred, gt, mask);
             opt.backward_step(&loss);
         }
-        let test_accuracy = get_model_accuracy(&dataset_paths, &net)?;
+        let test_accuracy = get_model_accuracy(&dataset_paths, &net)?.0;
         info!("epoch: {:4} test acc: {:5.2}%", epoch, 100. * test_accuracy,);
     }
 
@@ -208,35 +211,35 @@ fn calculate_balance_loss(pred: Tensor, gt: Tensor, mask: Tensor) -> Tensor {
         / (positive_count.to_kind(Kind::Double) + negative_count.to_kind(Kind::Double) + eps)
 }
 
-fn get_model_accuracy(dataset_paths: &TextDetectionDataset, net: &FuncT<'static>) -> Result<f64> {
-    // let mut raw_metrics = Vec::new();
+fn get_model_accuracy(
+    dataset_paths: &TextDetectionDataset,
+    net: &FuncT<'static>,
+) -> Result<(f64, f64, f64)> {
+    let mut raw_metrics = Vec::new();
     for i in 0..dataset_paths.test_images.len() {
         let images = Tensor::load(&dataset_paths.test_images[i])?;
         let gts = Tensor::load(&dataset_paths.test_gt[i])?;
         let masks = Tensor::load(&dataset_paths.test_mask[i])?;
         let adjs = Tensor::load(&dataset_paths.test_adj[i])?;
         let pred = net.forward_t(&images, false);
-        let output = get_boxes_and_box_scores(&images, /* &gts, &masks, */ &adjs, &pred)?;
-        // let mut raw_metric = validate_measure(&images, &gts, &masks, &output)?;
-        // raw_metrics.append(&mut raw_metric);
+        let output = get_boxes_and_box_scores(&pred, &adjs)?;
+        // TODO: fix first 2 params (should be polygons + ignore flags)
+        raw_metrics.push(validate_measure(&images, &gts, &output.0, &output.1)?);
     }
-    // let metrics = gather_measure(raw_metrics)?;
-    Ok(0.)
+    let metrics = gather_measure(&raw_metrics)?;
+    Ok(metrics)
 }
 
 fn get_boxes_and_box_scores(
-    images: &Tensor,
-    // gts: &Tensor,
-    // masks: &Tensor,
-    adjust_values: &Tensor,
     pred: &Tensor,
-) -> Result<()> {
+    adjust_values: &Tensor,
+) -> Result<(Vec<Tensor>, Vec<Tensor>)> {
     let thresh = 0.3;
     let mut boxes_batch = Vec::new();
     let mut scores_batch = Vec::new();
     let segmentation = binarize(&pred, thresh)?;
 
-    for batch_index in 0..images.size()[0] {
+    for batch_index in 0..pred.size()[0] {
         let (boxes, scores) = get_boxes_from_bitmap(
             &pred.get(batch_index),
             &segmentation.get(batch_index),
@@ -245,7 +248,7 @@ fn get_boxes_and_box_scores(
         boxes_batch.push(boxes);
         scores_batch.push(scores);
     }
-    Ok(())
+    Ok((boxes_batch, scores_batch))
 }
 
 fn binarize(pred: &Tensor, thresh: f64) -> Result<Tensor> {
@@ -256,12 +259,12 @@ fn get_boxes_from_bitmap(
     pred_tensor: &Tensor,
     bitmap_tensor: &Tensor,
     adjust_values: &Tensor,
-) -> Result<(Vec<Tensor>, Tensor)> {
+) -> Result<(Tensor, Tensor)> {
     let max_candidates = 1000;
     let min_size = 3.;
     let box_thresh = 0.7;
 
-    let bitmap = bitmap_tensor.get(0); // The first channel
+    let bitmap = bitmap_tensor.get(0);
     let pred = pred_tensor.get(0);
     // convert bitmap to GrayImage
     let image = image_ops::convert_tensor_to_image(&(bitmap * 255))?;
@@ -276,7 +279,7 @@ fn get_boxes_from_bitmap(
 
     for i in 0..num_contours {
         let contour = &contours[i];
-        boxes.push(Tensor::of_slice(&[0]));
+        boxes.push(Tensor::of_slice(&[-1, -1]).view((-1, 2)));
         let (points, sside) = get_mini_area_bounding_box(contour);
         if sside < min_size {
             continue;
@@ -291,14 +294,41 @@ fn get_boxes_from_bitmap(
             acc.push((p.1 as f64 / adjust_values.double_value(&[0, 1])).round() as i16);
             acc
         });
-        boxes[i] = Tensor::of_slice(&box_vec).view((4, 2));
+        boxes[i] = Tensor::of_slice(&box_vec).view((-1, 2));
         scores = scores.index_put(
             &[Tensor::of_slice(&[i as i64])],
             &Tensor::of_slice(&[score]),
             true,
         );
     }
-    Ok((boxes, scores))
+    // Merge tensors into one
+    let boxes_tensor = merge_point_tensors(&boxes)?;
+
+    Ok((boxes_tensor, scores))
+}
+
+fn merge_point_tensors(tensors: &[Tensor]) -> Result<Tensor> {
+    if let Some(max_points_num) = tensors.iter().map(|t| t.size()[0]).max() {
+        let padded_tensors = tensors
+            .iter()
+            .map(|t| {
+                let diff = max_points_num - t.size()[0];
+                if diff > 0 {
+                    return Tensor::cat(
+                        &[
+                            t,
+                            &Tensor::of_slice(&vec![-1; diff as usize * 2]).view((-1, 2)),
+                        ],
+                        0,
+                    );
+                }
+                t.shallow_clone()
+            })
+            .collect::<Vec<Tensor>>();
+
+        return Ok(Tensor::cat(&padded_tensors, 0).view((tensors.len() as i64, -1, 2)));
+    }
+    Err(anyhow!("The provided array is empty"))
 }
 
 fn get_mini_area_bounding_box(contour: &[(usize, usize)]) -> (Vec<(usize, usize)>, f64) {
@@ -319,10 +349,21 @@ fn box_score_fast(bitmap: &Tensor, points: &[(usize, usize)]) -> Result<f64> {
     let size = bitmap.size();
     let w = size[size.len() - 2] as usize;
     let h = size[size.len() - 1] as usize;
-    let min_x = clamp(points[0].0.min(points[3].0), 0, w - 1);
-    let max_x = clamp(points[1].0.max(points[2].0), 0, w - 1);
-    let min_y = clamp(points[0].1.min(points[1].1), 0, h - 1);
-    let max_y = clamp(points[2].1.max(points[3].1), 0, h - 1);
+    let (mut min_x, mut max_x, mut min_y, mut max_y) =
+        points
+            .iter()
+            .fold((std::usize::MAX, 0, std::usize::MAX, 0), |acc, p| {
+                (
+                    acc.0.min(p.0),
+                    acc.1.max(p.0),
+                    acc.2.min(p.1),
+                    acc.3.max(p.1),
+                )
+            });
+    min_x = clamp(min_x, 0, w - 1);
+    max_x = clamp(max_x, 0, w - 1);
+    min_y = clamp(min_y, 0, h - 1);
+    max_y = clamp(max_y, 0, h - 1);
     let mut mask_image = GrayImage::new((max_x - min_x + 1) as u32, (max_y - min_y + 1) as u32);
     let moved_points: Vec<Point<i32>> = points
         .iter()
@@ -340,6 +381,224 @@ fn box_score_fast(bitmap: &Tensor, points: &[(usize, usize)]) -> Result<f64> {
     let mean = partial_bitmap.sum(Kind::Double) / mask.sum(Kind::Double);
 
     Ok(mean.double_value(&[]))
+}
+
+//  Args:
+//      polygons: tensor of shape (N, K, M, 2), the polygons of objective regions.
+//      ignore_tags: tensor of shape (N, K), indicates whether a region is ignorable or not.
+//      pred: vector of length N of predicted polygons (each tensor of shape (M, 2) coresponds to a single image)
+//      scores: vector of length N of predicted polygons scores
+fn validate_measure(
+    polygons: &Tensor,
+    ignore_tags: &Tensor,
+    pred: &[Tensor],
+    scores: &[Tensor],
+    // is_output_polygon: bool,
+) -> Result<Vec<MetricsItem>> {
+    let is_output_polygon = false;
+    let box_thresh = 0.6;
+    let mut results = Vec::new();
+    for i in 0..polygons.size()[0] {
+        let curr_polygons = polygons.get(i);
+        let curr_ignore_tags = ignore_tags.get(i);
+
+        let mut pred_points = Vec::new();
+        for j in 0..pred[i as usize].size()[0] {
+            if is_output_polygon || scores[i as usize].get(j).double_value(&[]) >= box_thresh {
+                pred_points.push(pred[i as usize].get(j));
+            }
+        }
+
+        results.push(evaluate_image(
+            (&curr_polygons, &curr_ignore_tags),
+            &pred_points,
+        )?);
+    }
+    Ok(results)
+}
+
+fn gather_measure(metrics: &[Vec<MetricsItem>]) -> Result<(f64, f64, f64)> {
+    let raw_metrics = metrics.iter().fold(Vec::new(), |mut acc, batch_metrics| {
+        acc.append(&mut batch_metrics.to_vec());
+        acc
+    });
+
+    Ok(combine_results(&raw_metrics)?)
+}
+
+fn combine_results(results: &[MetricsItem]) -> Result<(f64, f64, f64)> {
+    let mut num_global_care_gt = 0;
+    let mut num_global_care_det = 0;
+    let mut matched_sum = 0;
+
+    for res in results {
+        num_global_care_gt += res.gt_care;
+        num_global_care_det += res.det_care;
+        matched_sum += res.det_matched;
+    }
+    let method_recall = if num_global_care_gt == 0 {
+        0.
+    } else {
+        matched_sum as f64 / num_global_care_gt as f64
+    };
+    let method_precision = if num_global_care_det == 0 {
+        0.
+    } else {
+        matched_sum as f64 / num_global_care_det as f64
+    };
+    let method_hmean = if method_recall + method_precision == 0. {
+        0.
+    } else {
+        2. * (method_recall * method_precision) / (method_recall + method_precision)
+    };
+    Ok((method_precision, method_recall, method_hmean))
+}
+
+fn evaluate_image(gt: (&Tensor, &Tensor), pred: &[Tensor]) -> Result<MetricsItem> {
+    let area_precision_constraint = 0.5;
+    let iou_constraint = 0.5;
+
+    let mut det_matched = 0;
+
+    let mut gt_polys = Vec::new();
+    let mut det_polys = Vec::new();
+
+    let mut gt_dont_care_pols_num = Vec::new();
+    let mut det_dont_care_pols_num = Vec::new();
+
+    let mut pairs = Vec::new();
+    let mut det_matched_nums = Vec::new();
+
+    for n in 0..gt.0.size()[0] {
+        let mut points = Vec::new();
+        let gt_points = gt.0.get(n);
+        for i in 0..gt_points.size()[0] {
+            let x = gt_points.double_value(&[i, 0]);
+            let y = gt_points.double_value(&[i, 1]);
+            if x < 0. {
+                break;
+            }
+            points.push((x, y));
+        }
+        let polygon = Polygon::new(LineString::from(points), vec![]);
+        let dont_care = gt.1.get(n).double_value(&[]) > 0.;
+
+        gt_polys.push(polygon);
+        if dont_care {
+            gt_dont_care_pols_num.push(gt_polys.len() - 1);
+        }
+    }
+
+    for pred_tensor in pred {
+        let mut points = Vec::new();
+        for i in 0..pred_tensor.size()[0] {
+            let x = pred_tensor.double_value(&[i, 0]);
+            let y = pred_tensor.double_value(&[i, 1]);
+            if x < 0. {
+                break;
+            }
+            points.push((x, y));
+        }
+        let polygon = Polygon::new(LineString::from(points), vec![]);
+        det_polys.push(polygon.clone());
+        if !gt_dont_care_pols_num.is_empty() {
+            for &dont_care_poly in &gt_dont_care_pols_num {
+                let intersected_area = get_intersection(&gt_polys[dont_care_poly], &polygon)?;
+                let pd_area = polygon.unsigned_area();
+                let precision = if pd_area == 0. {
+                    0.
+                } else {
+                    intersected_area / pd_area
+                };
+                if precision > area_precision_constraint {
+                    det_dont_care_pols_num.push(det_polys.len() - 1);
+                    break;
+                }
+            }
+        }
+    }
+
+    if !gt_polys.is_empty() && !det_polys.is_empty() {
+        let size = [gt_polys.len(), det_polys.len()];
+        let mut iou_mat = vec![vec![0.; size[1]]; size[0]];
+        let mut gt_rect_mat = vec![0; gt_polys.len()];
+        let mut det_rect_mat = vec![0; det_polys.len()];
+        for gt_num in 0..gt_polys.len() {
+            for det_num in 0..det_polys.len() {
+                iou_mat[gt_num][det_num] =
+                    get_intersection_over_union(&det_polys[det_num], &gt_polys[gt_num])?;
+
+                if gt_rect_mat[gt_num] == 0
+                    && det_rect_mat[det_num] == 0
+                    && !gt_dont_care_pols_num.contains(&gt_num)
+                    && !gt_dont_care_pols_num.contains(&det_num)
+                    && iou_mat[gt_num][det_num] > iou_constraint
+                {
+                    gt_rect_mat[gt_num] = 1;
+                    det_rect_mat[det_num] = 1;
+                    det_matched += 1;
+                    pairs.push((gt_num, det_num));
+                    det_matched_nums.push(det_num);
+                }
+            }
+        }
+    }
+
+    let num_gt_care = gt_polys.len() - gt_dont_care_pols_num.len();
+    let num_det_care = det_polys.len() - det_dont_care_pols_num.len();
+    let recall;
+    let precision;
+    if num_gt_care == 0 {
+        recall = 1.;
+        precision = if num_det_care > 0 { 0. } else { 1. };
+    } else {
+        recall = det_matched as f64 / num_gt_care as f64;
+        precision = if num_det_care == 0 {
+            0.
+        } else {
+            det_matched as f64 / num_det_care as f64
+        };
+    }
+
+    let hmean;
+    if precision + recall == 0. {
+        hmean = 0.;
+    } else {
+        hmean = 2. * precision * recall / (precision + recall);
+    };
+
+    Ok(MetricsItem {
+        precision,
+        recall,
+        hmean,
+        gt_care: num_gt_care,
+        det_care: num_det_care,
+        det_matched,
+    })
+}
+
+fn get_intersection(poly1: &Polygon<f64>, poly2: &Polygon<f64>) -> Result<f64> {
+    let intersection = poly1.intersection(poly2);
+    Ok(intersection.unsigned_area())
+}
+
+fn get_union(poly1: &Polygon<f64>, poly2: &Polygon<f64>) -> Result<f64> {
+    let union = poly1.union(poly2);
+    Ok(union.unsigned_area())
+}
+
+fn get_intersection_over_union(poly1: &Polygon<f64>, poly2: &Polygon<f64>) -> Result<f64> {
+    Ok(get_intersection(poly1, poly2)? / get_union(poly1, poly2)?)
+}
+
+#[derive(Copy, Clone, Debug)]
+struct MetricsItem {
+    precision: f64,
+    recall: f64,
+    hmean: f64,
+    gt_care: usize,
+    det_care: usize,
+    det_matched: usize,
 }
 
 #[cfg(test)]
@@ -497,15 +756,16 @@ mod tests {
 
         // 2x adjustment
         let adjust_values = Tensor::of_slice(&[2., 2.]).view((1, 2));
-        let expected_boxes = vec![
+        let expected_boxes = Tensor::of_slice(&[
             // expected boxes are reajdusted to the original image size (divided by adjust values)
-            Tensor::of_slice(&[30i16, 8, 71, 12, 69, 31, 29, 27]).view((4, 2)),
-            Tensor::of_slice(&[118i16, 9, 151, 11, 150, 30, 117, 27]).view((4, 2)),
-            Tensor::of_slice(&[4i16, 38, 74, 48, 73, 56, 2, 46]).view((4, 2)),
-            Tensor::of_slice(&[125i16, 40, 152, 43, 150, 63, 123, 60]).view((4, 2)),
-            Tensor::of_slice(&[13i16, 91, 63, 91, 63, 134, 13, 134]).view((4, 2)),
-            Tensor::of_slice(&[95i16, 125, 128, 93, 143, 108, 110, 140]).view((4, 2)),
-        ];
+            30i16, 8, 71, 12, 69, 31, 29, 27, // 1
+            118i16, 9, 151, 11, 150, 30, 117, 27, // 2
+            4i16, 38, 74, 48, 73, 56, 2, 46, // 3
+            125i16, 40, 152, 43, 150, 63, 123, 60, // 4
+            13i16, 91, 63, 91, 63, 134, 13, 134, // 5
+            95i16, 125, 128, 93, 143, 108, 110, 140, // 6
+        ])
+        .view((6, -1, 2));
         let expected_scores = Tensor::ones(&[6], (Kind::Double, Device::cuda_if_available()));
         assert_eq!(
             get_boxes_from_bitmap(&pred_tensor, &bitmap_tensor, &adjust_values)?,
@@ -525,20 +785,244 @@ mod tests {
         let pred_tensor = (convert_image_to_tensor(&polygons_image)? / 255.).view((1, h, w));
         // no adjustment
         let adjust_values = Tensor::of_slice(&[1., 1.]).view((1, 2));
-        let expected_boxes = vec![
+        let expected_boxes = Tensor::of_slice(&[
             // expected boxes with score over thresh (0.7) should appear
-            Tensor::of_slice(&[0]),
-            Tensor::of_slice(&[0]),
-            Tensor::of_slice(&[0]),
-            Tensor::of_slice(&[250, 79, 303, 85, 299, 126, 245, 120]).view((4, 2)),
-            Tensor::of_slice(&[25, 181, 125, 181, 125, 268, 25, 268]).view((4, 2)),
-            Tensor::of_slice(&[0]),
-        ];
+            -1, -1, -1, -1, -1, -1, -1, -1, // 1
+            -1, -1, -1, -1, -1, -1, -1, -1, // 2
+            -1, -1, -1, -1, -1, -1, -1, -1, // 3
+            250, 79, 303, 85, 299, 126, 245, 120, // 4
+            25, 181, 125, 181, 125, 268, 25, 268, // 5
+            -1, -1, -1, -1, -1, -1, -1, -1, // 6
+        ])
+        .view((6, -1, 2));
         let expected_scores =
             Tensor::of_slice(&[0., 0., 0., 0.703405017921147, 0.7521377137713772, 0.]);
         assert_eq!(
             get_boxes_from_bitmap(&pred_tensor, &bitmap_tensor, &adjust_values)?,
             (expected_boxes, expected_scores)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn merge_point_tensors_test() -> Result<()> {
+        let tensors = [
+            Tensor::of_slice(&[10, 10, 20, 10, 20, 20, 10, 20]).view((-1, 2)),
+            Tensor::of_slice(&[100, 10, 120, 10, 140, 20, 120, 20, 100, 20]).view((-1, 2)),
+            Tensor::of_slice(&[
+                100, 100, 120, 100, 140, 120, 120, 140, 100, 140, 80, 120, 90, 110,
+            ])
+            .view((-1, 2)),
+            Tensor::of_slice(&[10, 100, 20, 100, 40, 120, 20, 120]).view((-1, 2)),
+        ];
+        assert_eq!(
+            merge_point_tensors(&tensors)?,
+            Tensor::of_slice(&[
+                10, 10, 20, 10, 20, 20, 10, 20, -1, -1, -1, -1, -1, -1, // poly 1
+                100, 10, 120, 10, 140, 20, 120, 20, 100, 20, -1, -1, -1, -1, // poly 2
+                100, 100, 120, 100, 140, 120, 120, 140, 100, 140, 80, 120, 90, 110, // poly 3
+                10, 100, 20, 100, 40, 120, 20, 120, -1, -1, -1, -1, -1, -1 // poly 4
+            ])
+            .view((4, -1, 2))
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn evaluate_image_test_one_matching_polygon() -> Result<()> {
+        let gt_polygons_tensor = Tensor::of_slice(&[
+            0, 0, 10, 0, 10, 10, 0, 10, // poly 1
+            20, 20, 30, 20, 30, 30, 20, 30, // poly 2
+        ])
+        .view((2, -1, 2));
+        let ignore_polygons_tensor = Tensor::of_slice(&[0, 0]);
+        let pred = [Tensor::of_slice(&[1, 1, 10, 0, 10, 10, 0, 10]).view((-1, 2))];
+        let metrics = evaluate_image((&gt_polygons_tensor, &ignore_polygons_tensor), &pred)?;
+
+        assert_eq!(metrics.gt_care, 2);
+        assert_eq!(metrics.det_care, 1);
+        assert_eq!(metrics.det_matched, 1);
+        assert!(metrics.precision - 1. < ERROR_THRESHOLD);
+        assert!(metrics.recall - 0.5 < ERROR_THRESHOLD);
+        assert!(metrics.hmean - 0.6666666666666666 < ERROR_THRESHOLD);
+
+        Ok(())
+    }
+
+    #[test]
+    fn evaluate_image_test_with_ignored_polygons() -> Result<()> {
+        let gt_polygons_tensor = Tensor::of_slice(&[
+            0, 0, 10, 0, 10, 10, 0, 10, // poly 1
+            20, 20, 30, 20, 30, 30, 20, 30, // poly 2
+        ])
+        .view((2, -1, 2));
+        let ignore_polygons_tensor = Tensor::of_slice(&[1, 1]);
+        let pred = [Tensor::of_slice(&[1, 1, 10, 0, 10, 10, 0, 10]).view((-1, 2))];
+        let metrics = evaluate_image((&gt_polygons_tensor, &ignore_polygons_tensor), &pred)?;
+
+        assert_eq!(metrics.gt_care, 0);
+        assert_eq!(metrics.det_care, 0);
+        assert_eq!(metrics.det_matched, 0);
+        assert!(metrics.precision - 1. < ERROR_THRESHOLD);
+        assert!(metrics.recall - 1. < ERROR_THRESHOLD);
+        assert!(metrics.hmean - 1. < ERROR_THRESHOLD);
+
+        Ok(())
+    }
+
+    #[test]
+    fn evaluate_image_test_with_both_matched_polygons() -> Result<()> {
+        let gt_polygons_tensor = Tensor::of_slice(&[
+            0, 0, 10, 0, 10, 10, 0, 10, // poly 1
+            20, 20, 30, 20, 30, 30, 20, 30, // poly 2
+        ])
+        .view((2, -1, 2));
+        let ignore_polygons_tensor = Tensor::of_slice(&[0, 0]);
+        let pred = [
+            Tensor::of_slice(&[1, 1, 10, 0, 10, 10, 0, 10]).view((-1, 2)),
+            Tensor::of_slice(&[20, 20, 30, 20, 30, 30, 20, 30]).view((-1, 2)),
+        ];
+        let metrics = evaluate_image((&gt_polygons_tensor, &ignore_polygons_tensor), &pred)?;
+
+        assert_eq!(metrics.gt_care, 2);
+        assert_eq!(metrics.det_care, 2);
+        assert_eq!(metrics.det_matched, 2);
+        assert!(metrics.precision - 1. < ERROR_THRESHOLD);
+        assert!(metrics.recall - 1. < ERROR_THRESHOLD);
+        assert!(metrics.hmean - 1. < ERROR_THRESHOLD);
+
+        Ok(())
+    }
+
+    #[test]
+    fn validate_measure_test() -> Result<()> {
+        let gt_polygons_tensor = Tensor::of_slice(&[
+            // image 1
+            0, 0, 10, 0, 10, 10, 0, 10, // poly 1
+            20, 20, 30, 20, 30, 30, 20, 30, // poly 2
+            // image 2
+            0, 0, 10, 0, 10, 10, 0, 10, // poly 1
+            20, 20, 30, 20, 30, 30, 20, 30, // poly 2
+        ])
+        .view((2, 2, -1, 2));
+        let ignore_polygons_tensor = Tensor::of_slice(&[
+            0, 0, // image 1
+            0, 0, // image 2
+        ])
+        .view((2, -1));
+        let pred = [
+            Tensor::of_slice(&[1, 1, 10, 0, 10, 10, 0, 10]).view((1, -1, 2)),
+            Tensor::of_slice(&[45, 61, 47, 41, 60, 60, 39, 48]).view((1, -1, 2)),
+        ];
+        let scores = [Tensor::of_slice(&[0.9]), Tensor::of_slice(&[0.9])];
+        let metrics =
+            validate_measure(&gt_polygons_tensor, &ignore_polygons_tensor, &pred, &scores)?;
+        assert_eq!(metrics.len(), 2);
+
+        // image 1 metrics (having 1 matched polygon)
+        assert_eq!(metrics[0].gt_care, 2);
+        assert_eq!(metrics[0].det_care, 1);
+        assert_eq!(metrics[0].det_matched, 1);
+        assert!(metrics[0].precision - 1. < ERROR_THRESHOLD);
+        assert!(metrics[0].recall - 0.5 < ERROR_THRESHOLD);
+        assert!(metrics[0].hmean - 0.6666666666666666 < ERROR_THRESHOLD);
+
+        // image 2 metrics (having 0 matched polygons)
+        assert_eq!(metrics[1].gt_care, 2);
+        assert_eq!(metrics[1].det_care, 1);
+        assert_eq!(metrics[1].det_matched, 0);
+        assert!(metrics[1].precision < ERROR_THRESHOLD);
+        assert!(metrics[1].recall < ERROR_THRESHOLD);
+        assert!(metrics[1].hmean < ERROR_THRESHOLD);
+        Ok(())
+    }
+
+    #[test]
+    fn combine_results_test() -> Result<()> {
+        let metrics = [
+            MetricsItem {
+                precision: 1.,
+                recall: 0.5,
+                hmean: 0.6666666666666666,
+                gt_care: 2,
+                det_care: 1,
+                det_matched: 1,
+            },
+            MetricsItem {
+                precision: 1.,
+                recall: 1.,
+                hmean: 1.,
+                gt_care: 0,
+                det_care: 0,
+                det_matched: 0,
+            },
+            MetricsItem {
+                precision: 1.,
+                recall: 1.,
+                hmean: 1.,
+                gt_care: 2,
+                det_care: 2,
+                det_matched: 2,
+            },
+            MetricsItem {
+                precision: 0.3333333333333333,
+                recall: 0.2,
+                hmean: 0.25,
+                gt_care: 5,
+                det_care: 3,
+                det_matched: 1,
+            },
+        ];
+        assert_eq!(
+            combine_results(&metrics)?,
+            (0.6666666666666666, 0.4444444444444444, 0.5333333333333333)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn gather_measure_test() -> Result<()> {
+        let metrics = [
+            vec![
+                MetricsItem {
+                    precision: 1.,
+                    recall: 0.5,
+                    hmean: 0.6666666666666666,
+                    gt_care: 2,
+                    det_care: 1,
+                    det_matched: 1,
+                },
+                MetricsItem {
+                    precision: 1.,
+                    recall: 1.,
+                    hmean: 1.,
+                    gt_care: 0,
+                    det_care: 0,
+                    det_matched: 0,
+                },
+            ],
+            vec![
+                MetricsItem {
+                    precision: 1.,
+                    recall: 1.,
+                    hmean: 1.,
+                    gt_care: 2,
+                    det_care: 2,
+                    det_matched: 2,
+                },
+                MetricsItem {
+                    precision: 0.3333333333333333,
+                    recall: 0.2,
+                    hmean: 0.25,
+                    gt_care: 5,
+                    det_care: 3,
+                    det_matched: 1,
+                },
+            ],
+        ];
+        assert_eq!(
+            gather_measure(&metrics)?,
+            (0.6666666666666666, 0.4444444444444444, 0.5333333333333333)
         );
         Ok(())
     }
