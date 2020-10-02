@@ -167,6 +167,9 @@ pub fn create_and_train_model() -> Result<FuncT<'static>> {
             let image = Tensor::load(&dataset_paths.train_images[i])?;
             let gt = Tensor::load(&dataset_paths.train_gt[i])?;
             let mask = Tensor::load(&dataset_paths.train_mask[i])?;
+            let polygons = image_ops::load_polygons_vec_from_file(&dataset_paths.train_polys[i])?;
+            let ignore_flags =
+                image_ops::load_polygons_vec_from_file(&dataset_paths.train_ignore_flags[i])?;
             let pred = net.forward_t(&image, true);
             let loss = calculate_balance_loss(pred, gt, mask);
             opt.backward_step(&loss);
@@ -221,10 +224,18 @@ fn get_model_accuracy(
         let gts = Tensor::load(&dataset_paths.test_gt[i])?;
         let masks = Tensor::load(&dataset_paths.test_mask[i])?;
         let adjs = Tensor::load(&dataset_paths.test_adj[i])?;
+        let polys = image_ops::load_polygons_vec_from_file(&dataset_paths.test_polys[i])?;
+        let ignore_flags =
+            image_ops::load_ignore_flags_vec_from_file(&dataset_paths.test_ignore_flags[i])?;
         let pred = net.forward_t(&images, false);
         let output = get_boxes_and_box_scores(&pred, &adjs)?;
         // TODO: fix first 2 params (should be polygons + ignore flags)
-        raw_metrics.push(validate_measure(&images, &gts, &output.0, &output.1)?);
+        raw_metrics.push(validate_measure(
+            &polys,
+            &ignore_flags,
+            &output.0,
+            &output.1,
+        )?);
     }
     let metrics = gather_measure(&raw_metrics)?;
     Ok(metrics)
@@ -233,7 +244,7 @@ fn get_model_accuracy(
 fn get_boxes_and_box_scores(
     pred: &Tensor,
     adjust_values: &Tensor,
-) -> Result<(Vec<Tensor>, Vec<Tensor>)> {
+) -> Result<(Vec<Vec<Vec<(u32, u32)>>>, Vec<Vec<f64>>)> {
     let thresh = 0.3;
     let mut boxes_batch = Vec::new();
     let mut scores_batch = Vec::new();
@@ -259,7 +270,7 @@ fn get_boxes_from_bitmap(
     pred_tensor: &Tensor,
     bitmap_tensor: &Tensor,
     adjust_values: &Tensor,
-) -> Result<(Tensor, Tensor)> {
+) -> Result<(Vec<Vec<(u32, u32)>>, Vec<f64>)> {
     let max_candidates = 1000;
     let min_size = 3.;
     let box_thresh = 0.7;
@@ -271,15 +282,11 @@ fn get_boxes_from_bitmap(
 
     let contours = image_ops::find_contours(&image)?;
     let num_contours = contours.len().min(max_candidates);
-    let mut boxes = Vec::with_capacity(num_contours);
-    let mut scores = Tensor::zeros(
-        &[num_contours as i64],
-        (Kind::Double, Device::cuda_if_available()),
-    );
+    let mut boxes = vec![vec![]; num_contours];
+    let mut scores = vec![0.; num_contours];
 
     for i in 0..num_contours {
         let contour = &contours[i];
-        boxes.push(Tensor::of_slice(&[-1, -1]).view((-1, 2)));
         let (points, sside) = get_mini_area_bounding_box(contour);
         if sside < min_size {
             continue;
@@ -289,46 +296,17 @@ fn get_boxes_from_bitmap(
             continue;
         }
 
-        let box_vec = points.iter().fold(Vec::new(), |mut acc, p| {
-            acc.push((p.0 as f64 / adjust_values.double_value(&[0, 0])).round() as i16);
-            acc.push((p.1 as f64 / adjust_values.double_value(&[0, 1])).round() as i16);
+        boxes[i] = points.iter().fold(Vec::new(), |mut acc, p| {
+            acc.push((
+                (p.0 as f64 / adjust_values.double_value(&[0, 0])).round() as u32,
+                (p.1 as f64 / adjust_values.double_value(&[0, 1])).round() as u32,
+            ));
             acc
         });
-        boxes[i] = Tensor::of_slice(&box_vec).view((-1, 2));
-        scores = scores.index_put(
-            &[Tensor::of_slice(&[i as i64])],
-            &Tensor::of_slice(&[score]),
-            true,
-        );
+        scores[i] = score;
     }
-    // Merge tensors into one
-    let boxes_tensor = merge_point_tensors(&boxes)?;
 
-    Ok((boxes_tensor, scores))
-}
-
-fn merge_point_tensors(tensors: &[Tensor]) -> Result<Tensor> {
-    if let Some(max_points_num) = tensors.iter().map(|t| t.size()[0]).max() {
-        let padded_tensors = tensors
-            .iter()
-            .map(|t| {
-                let diff = max_points_num - t.size()[0];
-                if diff > 0 {
-                    return Tensor::cat(
-                        &[
-                            t,
-                            &Tensor::of_slice(&vec![-1; diff as usize * 2]).view((-1, 2)),
-                        ],
-                        0,
-                    );
-                }
-                t.shallow_clone()
-            })
-            .collect::<Vec<Tensor>>();
-
-        return Ok(Tensor::cat(&padded_tensors, 0).view((tensors.len() as i64, -1, 2)));
-    }
-    Err(anyhow!("The provided array is empty"))
+    Ok((boxes, scores))
 }
 
 fn get_mini_area_bounding_box(contour: &[(usize, usize)]) -> (Vec<(usize, usize)>, f64) {
@@ -389,29 +367,26 @@ fn box_score_fast(bitmap: &Tensor, points: &[(usize, usize)]) -> Result<f64> {
 //      pred: vector of length N of predicted polygons (each tensor of shape (M, 2) coresponds to a single image)
 //      scores: vector of length N of predicted polygons scores
 fn validate_measure(
-    polygons: &Tensor,
-    ignore_tags: &Tensor,
-    pred: &[Tensor],
-    scores: &[Tensor],
+    polygons: &[Vec<Vec<(u32, u32)>>],
+    ignore_tags: &[Vec<bool>],
+    pred: &[Vec<Vec<(u32, u32)>>],
+    scores: &[Vec<f64>],
     // is_output_polygon: bool,
 ) -> Result<Vec<MetricsItem>> {
     let is_output_polygon = false;
     let box_thresh = 0.6;
     let mut results = Vec::new();
-    for i in 0..polygons.size()[0] {
-        let curr_polygons = polygons.get(i);
-        let curr_ignore_tags = ignore_tags.get(i);
-
-        let mut pred_points = Vec::new();
-        for j in 0..pred[i as usize].size()[0] {
-            if is_output_polygon || scores[i as usize].get(j).double_value(&[]) >= box_thresh {
-                pred_points.push(pred[i as usize].get(j));
+    for i in 0..polygons.len() {
+        let mut pred_polygons = Vec::new();
+        for j in 0..pred[i as usize].len() {
+            if is_output_polygon || scores[i as usize][j] >= box_thresh {
+                pred_polygons.push(pred[i as usize][j].clone());
             }
         }
 
         results.push(evaluate_image(
-            (&curr_polygons, &curr_ignore_tags),
-            &pred_points,
+            (&polygons[i], &ignore_tags[i]),
+            &pred_polygons,
         )?);
     }
     Ok(results)
@@ -454,9 +429,13 @@ fn combine_results(results: &[MetricsItem]) -> Result<(f64, f64, f64)> {
     Ok((method_precision, method_recall, method_hmean))
 }
 
-fn evaluate_image(gt: (&Tensor, &Tensor), pred: &[Tensor]) -> Result<MetricsItem> {
+fn evaluate_image(
+    gt: (&[Vec<(u32, u32)>], &[bool]),
+    pred: &[Vec<(u32, u32)>],
+) -> Result<MetricsItem> {
     let area_precision_constraint = 0.5;
     let iou_constraint = 0.5;
+    let (gt_points, ignore_flags) = gt;
 
     let mut det_matched = 0;
 
@@ -469,37 +448,33 @@ fn evaluate_image(gt: (&Tensor, &Tensor), pred: &[Tensor]) -> Result<MetricsItem
     let mut pairs = Vec::new();
     let mut det_matched_nums = Vec::new();
 
-    for n in 0..gt.0.size()[0] {
-        let mut points = Vec::new();
-        let gt_points = gt.0.get(n);
-        for i in 0..gt_points.size()[0] {
-            let x = gt_points.double_value(&[i, 0]);
-            let y = gt_points.double_value(&[i, 1]);
-            if x < 0. {
-                break;
-            }
-            points.push((x, y));
-        }
-        let polygon = Polygon::new(LineString::from(points), vec![]);
-        let dont_care = gt.1.get(n).double_value(&[]) > 0.;
+    for n in 0..gt.0.len() {
+        let polygon = Polygon::new(
+            LineString::from(
+                gt_points[n]
+                    .iter()
+                    .map(|p| (p.0 as f64, p.1 as f64))
+                    .collect::<Vec<(f64, f64)>>(),
+            ),
+            vec![],
+        );
 
         gt_polys.push(polygon);
-        if dont_care {
+        if ignore_flags[n] {
             gt_dont_care_pols_num.push(gt_polys.len() - 1);
         }
     }
 
     for pred_tensor in pred {
-        let mut points = Vec::new();
-        for i in 0..pred_tensor.size()[0] {
-            let x = pred_tensor.double_value(&[i, 0]);
-            let y = pred_tensor.double_value(&[i, 1]);
-            if x < 0. {
-                break;
-            }
-            points.push((x, y));
-        }
-        let polygon = Polygon::new(LineString::from(points), vec![]);
+        let polygon = Polygon::new(
+            LineString::from(
+                pred_tensor
+                    .iter()
+                    .map(|p| (p.0 as f64, p.1 as f64))
+                    .collect::<Vec<(f64, f64)>>(),
+            ),
+            vec![],
+        );
         det_polys.push(polygon.clone());
         if !gt_dont_care_pols_num.is_empty() {
             for &dont_care_poly in &gt_dont_care_pols_num {
@@ -756,17 +731,16 @@ mod tests {
 
         // 2x adjustment
         let adjust_values = Tensor::of_slice(&[2., 2.]).view((1, 2));
-        let expected_boxes = Tensor::of_slice(&[
+        let expected_boxes = vec![
             // expected boxes are reajdusted to the original image size (divided by adjust values)
-            30i16, 8, 71, 12, 69, 31, 29, 27, // 1
-            118i16, 9, 151, 11, 150, 30, 117, 27, // 2
-            4i16, 38, 74, 48, 73, 56, 2, 46, // 3
-            125i16, 40, 152, 43, 150, 63, 123, 60, // 4
-            13i16, 91, 63, 91, 63, 134, 13, 134, // 5
-            95i16, 125, 128, 93, 143, 108, 110, 140, // 6
-        ])
-        .view((6, -1, 2));
-        let expected_scores = Tensor::ones(&[6], (Kind::Double, Device::cuda_if_available()));
+            vec![(30, 8), (71, 12), (69, 31), (29, 27)], // 1
+            vec![(118, 9), (151, 11), (150, 30), (117, 27)], // 2
+            vec![(4, 38), (74, 48), (73, 56), (2, 46)],  // 3
+            vec![(125, 40), (152, 43), (150, 63), (123, 60)], // 4
+            vec![(13, 91), (63, 91), (63, 134), (13, 134)], // 5
+            vec![(95, 125), (128, 93), (143, 108), (110, 140)], // 6
+        ];
+        let expected_scores = vec![1.; 6];
         assert_eq!(
             get_boxes_from_bitmap(&pred_tensor, &bitmap_tensor, &adjust_values)?,
             (expected_boxes, expected_scores)
@@ -785,18 +759,16 @@ mod tests {
         let pred_tensor = (convert_image_to_tensor(&polygons_image)? / 255.).view((1, h, w));
         // no adjustment
         let adjust_values = Tensor::of_slice(&[1., 1.]).view((1, 2));
-        let expected_boxes = Tensor::of_slice(&[
+        let expected_boxes = vec![
             // expected boxes with score over thresh (0.7) should appear
-            -1, -1, -1, -1, -1, -1, -1, -1, // 1
-            -1, -1, -1, -1, -1, -1, -1, -1, // 2
-            -1, -1, -1, -1, -1, -1, -1, -1, // 3
-            250, 79, 303, 85, 299, 126, 245, 120, // 4
-            25, 181, 125, 181, 125, 268, 25, 268, // 5
-            -1, -1, -1, -1, -1, -1, -1, -1, // 6
-        ])
-        .view((6, -1, 2));
-        let expected_scores =
-            Tensor::of_slice(&[0., 0., 0., 0.703405017921147, 0.7521377137713772, 0.]);
+            vec![],                                             // 1
+            vec![],                                             // 2
+            vec![],                                             // 3
+            vec![(250, 79), (303, 85), (299, 126), (245, 120)], // 4
+            vec![(25, 181), (125, 181), (125, 268), (25, 268)], // 5
+            vec![],                                             // 6
+        ];
+        let expected_scores = vec![0., 0., 0., 0.703405017921147, 0.7521377137713772, 0.];
         assert_eq!(
             get_boxes_from_bitmap(&pred_tensor, &bitmap_tensor, &adjust_values)?,
             (expected_boxes, expected_scores)
@@ -805,39 +777,14 @@ mod tests {
     }
 
     #[test]
-    fn merge_point_tensors_test() -> Result<()> {
-        let tensors = [
-            Tensor::of_slice(&[10, 10, 20, 10, 20, 20, 10, 20]).view((-1, 2)),
-            Tensor::of_slice(&[100, 10, 120, 10, 140, 20, 120, 20, 100, 20]).view((-1, 2)),
-            Tensor::of_slice(&[
-                100, 100, 120, 100, 140, 120, 120, 140, 100, 140, 80, 120, 90, 110,
-            ])
-            .view((-1, 2)),
-            Tensor::of_slice(&[10, 100, 20, 100, 40, 120, 20, 120]).view((-1, 2)),
-        ];
-        assert_eq!(
-            merge_point_tensors(&tensors)?,
-            Tensor::of_slice(&[
-                10, 10, 20, 10, 20, 20, 10, 20, -1, -1, -1, -1, -1, -1, // poly 1
-                100, 10, 120, 10, 140, 20, 120, 20, 100, 20, -1, -1, -1, -1, // poly 2
-                100, 100, 120, 100, 140, 120, 120, 140, 100, 140, 80, 120, 90, 110, // poly 3
-                10, 100, 20, 100, 40, 120, 20, 120, -1, -1, -1, -1, -1, -1 // poly 4
-            ])
-            .view((4, -1, 2))
-        );
-        Ok(())
-    }
-
-    #[test]
     fn evaluate_image_test_one_matching_polygon() -> Result<()> {
-        let gt_polygons_tensor = Tensor::of_slice(&[
-            0, 0, 10, 0, 10, 10, 0, 10, // poly 1
-            20, 20, 30, 20, 30, 30, 20, 30, // poly 2
-        ])
-        .view((2, -1, 2));
-        let ignore_polygons_tensor = Tensor::of_slice(&[0, 0]);
-        let pred = [Tensor::of_slice(&[1, 1, 10, 0, 10, 10, 0, 10]).view((-1, 2))];
-        let metrics = evaluate_image((&gt_polygons_tensor, &ignore_polygons_tensor), &pred)?;
+        let gt_polygons_tensor = [
+            vec![(0, 0), (10, 0), (10, 10), (0, 10)],     // poly 1
+            vec![(20, 20), (30, 20), (30, 30), (20, 30)], // poly 2
+        ];
+        let ignore_polygons = [false, false];
+        let pred = [vec![(1, 1), (10, 0), (10, 10), (0, 10)]];
+        let metrics = evaluate_image((&gt_polygons_tensor, &ignore_polygons), &pred)?;
 
         assert_eq!(metrics.gt_care, 2);
         assert_eq!(metrics.det_care, 1);
@@ -851,14 +798,13 @@ mod tests {
 
     #[test]
     fn evaluate_image_test_with_ignored_polygons() -> Result<()> {
-        let gt_polygons_tensor = Tensor::of_slice(&[
-            0, 0, 10, 0, 10, 10, 0, 10, // poly 1
-            20, 20, 30, 20, 30, 30, 20, 30, // poly 2
-        ])
-        .view((2, -1, 2));
-        let ignore_polygons_tensor = Tensor::of_slice(&[1, 1]);
-        let pred = [Tensor::of_slice(&[1, 1, 10, 0, 10, 10, 0, 10]).view((-1, 2))];
-        let metrics = evaluate_image((&gt_polygons_tensor, &ignore_polygons_tensor), &pred)?;
+        let gt_polygons_tensor = [
+            vec![(0, 0), (10, 0), (10, 10), (0, 10)],     // poly 1
+            vec![(20, 20), (30, 20), (30, 30), (20, 30)], // poly 2
+        ];
+        let ignore_polygons = [true, true];
+        let pred = [vec![(1, 1), (10, 0), (10, 10), (0, 10)]];
+        let metrics = evaluate_image((&gt_polygons_tensor, &ignore_polygons), &pred)?;
 
         assert_eq!(metrics.gt_care, 0);
         assert_eq!(metrics.det_care, 0);
@@ -872,17 +818,16 @@ mod tests {
 
     #[test]
     fn evaluate_image_test_with_both_matched_polygons() -> Result<()> {
-        let gt_polygons_tensor = Tensor::of_slice(&[
-            0, 0, 10, 0, 10, 10, 0, 10, // poly 1
-            20, 20, 30, 20, 30, 30, 20, 30, // poly 2
-        ])
-        .view((2, -1, 2));
-        let ignore_polygons_tensor = Tensor::of_slice(&[0, 0]);
-        let pred = [
-            Tensor::of_slice(&[1, 1, 10, 0, 10, 10, 0, 10]).view((-1, 2)),
-            Tensor::of_slice(&[20, 20, 30, 20, 30, 30, 20, 30]).view((-1, 2)),
+        let gt_polygons_tensor = [
+            vec![(0, 0), (10, 0), (10, 10), (0, 10)],     // poly 1
+            vec![(20, 20), (30, 20), (30, 30), (20, 30)], // poly 2
         ];
-        let metrics = evaluate_image((&gt_polygons_tensor, &ignore_polygons_tensor), &pred)?;
+        let ignore_polygons = [false, false];
+        let pred = vec![
+            vec![(1, 1), (10, 0), (10, 10), (0, 10)],
+            vec![(20, 20), (30, 20), (30, 30), (20, 30)],
+        ];
+        let metrics = evaluate_image((&gt_polygons_tensor, &ignore_polygons), &pred)?;
 
         assert_eq!(metrics.gt_care, 2);
         assert_eq!(metrics.det_care, 2);
@@ -896,27 +841,28 @@ mod tests {
 
     #[test]
     fn validate_measure_test() -> Result<()> {
-        let gt_polygons_tensor = Tensor::of_slice(&[
+        let gt_polygons_tensor = [
             // image 1
-            0, 0, 10, 0, 10, 10, 0, 10, // poly 1
-            20, 20, 30, 20, 30, 30, 20, 30, // poly 2
+            vec![
+                vec![(0, 0), (10, 0), (10, 10), (0, 10)],     // poly 1
+                vec![(20, 20), (30, 20), (30, 30), (20, 30)], // poly 2
+            ],
             // image 2
-            0, 0, 10, 0, 10, 10, 0, 10, // poly 1
-            20, 20, 30, 20, 30, 30, 20, 30, // poly 2
-        ])
-        .view((2, 2, -1, 2));
-        let ignore_polygons_tensor = Tensor::of_slice(&[
-            0, 0, // image 1
-            0, 0, // image 2
-        ])
-        .view((2, -1));
-        let pred = [
-            Tensor::of_slice(&[1, 1, 10, 0, 10, 10, 0, 10]).view((1, -1, 2)),
-            Tensor::of_slice(&[45, 61, 47, 41, 60, 60, 39, 48]).view((1, -1, 2)),
+            vec![
+                vec![(0, 0), (10, 0), (10, 10), (0, 10)],     // poly 1
+                vec![(20, 20), (30, 20), (30, 30), (20, 30)], // poly 2
+            ],
         ];
-        let scores = [Tensor::of_slice(&[0.9]), Tensor::of_slice(&[0.9])];
-        let metrics =
-            validate_measure(&gt_polygons_tensor, &ignore_polygons_tensor, &pred, &scores)?;
+        let ignore_polygons = [
+            vec![false, false], // image 1
+            vec![false, false], // image 2
+        ];
+        let pred = [
+            vec![vec![(1, 1), (10, 0), (10, 10), (0, 10)]],
+            vec![vec![(45, 61), (47, 41), (60, 60), (39, 48)]],
+        ];
+        let scores = [vec![0.9], vec![0.9]];
+        let metrics = validate_measure(&gt_polygons_tensor, &ignore_polygons, &pred, &scores)?;
         assert_eq!(metrics.len(), 2);
 
         // image 1 metrics (having 1 matched polygon)
