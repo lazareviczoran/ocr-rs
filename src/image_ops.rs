@@ -1091,6 +1091,7 @@ pub fn load_ignore_flags_vec_from_file(file_path: &str) -> Result<Vec<Vec<bool>>
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::image_ops;
     use image::open;
     use imageproc::drawing::{draw_polygon_mut, Point};
     use tch::{Device, Tensor};
@@ -1330,7 +1331,17 @@ mod tests {
             Tensor::of_slice(&[resized.0 / original_dim.0, resized.1 / original_dim.1])
         );
 
-        let test_images_tensor = Tensor::load(&filenames[4])?;
+        let train_polygons_vec = image_ops::load_polygons_vec_from_file(&filenames[4])?;
+        assert_eq!(train_polygons_vec.len(), 2);
+        assert_eq!(train_polygons_vec[0].len(), 4);
+        assert_eq!(train_polygons_vec[1].len(), 3);
+
+        let train_ignore_flags_vec = image_ops::load_ignore_flags_vec_from_file(&filenames[5])?;
+        assert_eq!(train_ignore_flags_vec.len(), 2);
+        assert_eq!(train_ignore_flags_vec[0].len(), 4);
+        assert_eq!(train_ignore_flags_vec[1].len(), 3);
+
+        let test_images_tensor = Tensor::load(&filenames[6])?;
         assert_eq!(test_images_tensor.size(), [2, 800, 800]);
         assert_eq!(
             test_images_tensor.get(0).to_kind(Kind::Double),
@@ -1341,7 +1352,7 @@ mod tests {
             convert_image_to_tensor(&test_img2)?
         );
 
-        let test_gts_tensor = Tensor::load(&filenames[5])?;
+        let test_gts_tensor = Tensor::load(&filenames[7])?;
         assert_eq!(test_gts_tensor.size(), [2, 800, 800]);
         assert_eq!(
             test_gts_tensor.get(0).to_kind(Kind::Double),
@@ -1352,7 +1363,7 @@ mod tests {
             convert_image_to_tensor(&test_gt_img2)? / 255.
         );
 
-        let test_masks_tensor = Tensor::load(&filenames[6])?;
+        let test_masks_tensor = Tensor::load(&filenames[8])?;
         assert_eq!(test_masks_tensor.size(), [2, 800, 800]);
         assert_eq!(
             test_masks_tensor.get(0).to_kind(Kind::Double),
@@ -1363,8 +1374,18 @@ mod tests {
             convert_image_to_tensor(&test_mask_img2)? / 255.
         );
 
-        let test_adj_tensor = Tensor::load(&filenames[7])?;
+        let test_adj_tensor = Tensor::load(&filenames[9])?;
         assert_eq!(test_adj_tensor.size(), [2, 2]);
+
+        let test_polygons_vec = image_ops::load_polygons_vec_from_file(&filenames[10])?;
+        assert_eq!(test_polygons_vec.len(), 2);
+        assert_eq!(test_polygons_vec[0].len(), 3);
+        assert_eq!(test_polygons_vec[1].len(), 3);
+
+        let test_ignore_flags_vec = image_ops::load_ignore_flags_vec_from_file(&filenames[11])?;
+        assert_eq!(test_ignore_flags_vec.len(), 2);
+        assert_eq!(test_ignore_flags_vec[0].len(), 3);
+        assert_eq!(test_ignore_flags_vec[1].len(), 3);
 
         original_dim = (200., 200.);
         resized = (800., 800.);
