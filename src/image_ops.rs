@@ -3,18 +3,20 @@ use super::utils::{VALUES_COUNT, VALUES_MAP};
 use anyhow::{anyhow, Result};
 use image::{imageops::FilterType, open, DynamicImage, GrayImage, ImageBuffer, Luma};
 use imageproc::drawing::{self, Point};
-use log::{debug, error, trace};
+use log::{error, trace};
 use rayon::prelude::*;
 use regex::Regex;
+use serde::Serialize;
 use std::cmp::Ordering;
 use std::collections::VecDeque;
 use std::f64::consts::PI;
-use std::fs::{self, File};
+use std::fs::{self, File, OpenOptions};
 use std::io::prelude::*;
+use std::io::BufReader;
 use std::path::Path;
 use std::time::Instant;
 use tch::vision::dataset::Dataset;
-use tch::{IndexOp, Kind, Tensor};
+use tch::{Kind, Tensor};
 
 const CHAR_REC_IMAGES_PATH: &str = "images";
 const CHAR_REC_TRAIN_IMAGES_FILE: &str = "training_images_data_char";
@@ -26,15 +28,19 @@ pub const TEXT_DET_TRAIN_IMAGES_FILE: &str = "training_images_data_text_det";
 pub const TEXT_DET_TRAIN_GT_FILE: &str = "training_gt_data_text_det";
 pub const TEXT_DET_TRAIN_MASK_FILE: &str = "training_mask_data_text_det";
 pub const TEXT_DET_TRAIN_ADJ_FILE: &str = "training_adj_data_text_det";
+pub const TEXT_DET_TRAIN_POLYS_FILE: &str = "training_polys_data_text_det";
+pub const TEXT_DET_TRAIN_IGNORE_FLAGS_FILE: &str = "training_ignore_flags_data_text_det";
 pub const TEXT_DET_TEST_IMAGES_FILE: &str = "test_images_data_text_det";
 pub const TEXT_DET_TEST_GT_FILE: &str = "test_gt_data_text_det";
 pub const TEXT_DET_TEST_MASK_FILE: &str = "test_mask_data_text_det";
 pub const TEXT_DET_TEST_ADJ_FILE: &str = "test_adj_data_text_det";
+pub const TEXT_DET_TEST_POLYS_FILE: &str = "test_polys_data_text_det";
+pub const TEXT_DET_TEST_IGNORE_FLAGS_FILE: &str = "test_ignore_flags_data_text_det";
 const DEFAULT_WIDTH: u32 = 800;
 const DEFAULT_HEIGHT: u32 = 800;
 const WHITE_COLOR: Luma<u8> = Luma([255]);
 const BLACK_COLOR: Luma<u8> = Luma([0]);
-const MIN_TEXT_SIZE: i32 = 8;
+const MIN_TEXT_SIZE: u32 = 8;
 
 lazy_static! {
     static ref CHAR_REC_FILE_NAME_FORMAT_REGEX: Regex =
@@ -220,7 +226,7 @@ pub fn preprocess_image(file_path: &str, target_dim: (u32, u32)) -> Result<(Gray
 }
 
 fn generate_gt_and_mask_images(
-    polygons: &[Tensor],
+    polygons: &[Vec<(u32, u32)>],
     adjust_x: f64,
     adjust_y: f64,
     target_dim: (u32, u32),
@@ -232,14 +238,19 @@ fn generate_gt_and_mask_images(
     mask_temp.invert();
     let mut mask_image = mask_temp.to_luma();
     for (pos, poly) in polygons.iter().enumerate() {
-        let (num_of_points, _) = poly.size2()?;
-        let poly_width = (poly.i((.., 0)).max() - poly.i((.., 0)).min()).int64_value(&[]) as i32;
-        let poly_height = (poly.i((.., 1)).max() - poly.i((.., 1)).min()).int64_value(&[]) as i32;
+        let num_of_points = poly.len();
+        let (min_x, max_x, min_y, max_y) = poly
+            .iter()
+            .fold((std::u32::MAX, 0, std::u32::MAX, 0), |acc, (x, y)| {
+                (acc.0.min(*x), acc.1.max(*x), acc.2.min(*y), acc.3.max(*y))
+            });
+        let poly_width = max_x - min_x;
+        let poly_height = max_y - min_y;
         let poly_values = (0..num_of_points)
             .map(|i| {
                 Point::new(
-                    (poly.double_value(&[i, 0]) * adjust_x) as i32,
-                    (poly.double_value(&[i, 1]) * adjust_y) as i32,
+                    (poly[i].0 as f64 * adjust_x) as i32,
+                    (poly[i].1 as f64 * adjust_y) as i32,
                 )
             })
             .collect::<Vec<Point<i32>>>();
@@ -257,7 +268,7 @@ fn generate_gt_and_mask_images(
     Ok((gt_image, mask_image, ignore_flags))
 }
 
-fn load_polygons(file_path: &str) -> Result<Vec<Tensor>> {
+fn load_polygons(file_path: &str) -> Result<Vec<Vec<(u32, u32)>>> {
     let polygons;
     if let Ok(mut file) = File::open(file_path) {
         let mut content = String::new();
@@ -276,8 +287,8 @@ fn load_polygons(file_path: &str) -> Result<Vec<Tensor>> {
                 let values = raw_values[0..raw_values.len() - 1]
                     .iter()
                     .flat_map(|v| v.parse())
-                    .collect::<Vec<i32>>();
-                Tensor::of_slice(&values).view((-1, 2))
+                    .collect::<Vec<u32>>();
+                values.chunks(2).map(|point| (point[0], point[1])).collect()
             })
             .collect();
     } else {
@@ -290,7 +301,14 @@ fn load_polygons(file_path: &str) -> Result<Vec<Tensor>> {
 pub fn load_text_detection_image(
     file_path: &str,
     target_dim: (u32, u32),
-) -> Result<(Tensor, Tensor, Tensor, Tensor)> {
+) -> Result<(
+    Tensor,
+    Tensor,
+    Tensor,
+    Tensor,
+    Vec<Vec<(u32, u32)>>,
+    Vec<bool>,
+)> {
     let instant = Instant::now();
     let (preprocessed_image, adjust_x, adjust_y) = preprocess_image(file_path, target_dim)?;
 
@@ -303,7 +321,7 @@ pub fn load_text_detection_image(
         path_parts[last_idx]
     ))?;
 
-    let (gt_image, mask_image, _ignore_flags) =
+    let (gt_image, mask_image, ignore_flags) =
         generate_gt_and_mask_images(&polygons, adjust_x, adjust_y, target_dim)?;
 
     let image_tensor = convert_image_to_tensor(&preprocessed_image)?.to_kind(Kind::Uint8);
@@ -316,7 +334,14 @@ pub fn load_text_detection_image(
         instant.elapsed().as_nanos()
     );
 
-    Ok((image_tensor, gt_tensor, mask_tensor, adjust_tensor))
+    Ok((
+        image_tensor,
+        gt_tensor,
+        mask_tensor,
+        adjust_tensor,
+        polygons,
+        ignore_flags,
+    ))
 }
 
 /// image size (w, h)
@@ -359,10 +384,14 @@ pub fn load_text_detection_tensor_files(target_dir: &str) -> Result<TextDetectio
         let mut train_gt = Vec::new();
         let mut train_mask = Vec::new();
         let mut train_adj = Vec::new();
+        let mut train_polys = Vec::new();
+        let mut train_ignore_flags = Vec::new();
         let mut test_images = Vec::new();
         let mut test_gt = Vec::new();
         let mut test_mask = Vec::new();
         let mut test_adj = Vec::new();
+        let mut test_polys = Vec::new();
+        let mut test_ignore_flags = Vec::new();
         files.for_each(|f| {
             let file = f.unwrap();
             let filename = file.file_name().into_string().unwrap();
@@ -375,6 +404,10 @@ pub fn load_text_detection_tensor_files(target_dir: &str) -> Result<TextDetectio
                 train_mask.push(path);
             } else if filename.starts_with(&get_target_filename(TEXT_DET_TRAIN_ADJ_FILE)) {
                 train_adj.push(path);
+            } else if filename.starts_with(&get_target_filename(TEXT_DET_TRAIN_POLYS_FILE)) {
+                train_polys.push(path);
+            } else if filename.starts_with(&get_target_filename(TEXT_DET_TRAIN_IGNORE_FLAGS_FILE)) {
+                train_ignore_flags.push(path);
             } else if filename.starts_with(&get_target_filename(TEXT_DET_TEST_IMAGES_FILE)) {
                 test_images.push(path);
             } else if filename.starts_with(&get_target_filename(TEXT_DET_TEST_GT_FILE)) {
@@ -383,6 +416,10 @@ pub fn load_text_detection_tensor_files(target_dir: &str) -> Result<TextDetectio
                 test_mask.push(path);
             } else if filename.starts_with(&get_target_filename(TEXT_DET_TEST_ADJ_FILE)) {
                 test_adj.push(path);
+            } else if filename.starts_with(&get_target_filename(TEXT_DET_TEST_POLYS_FILE)) {
+                test_polys.push(path);
+            } else if filename.starts_with(&get_target_filename(TEXT_DET_TEST_IGNORE_FLAGS_FILE)) {
+                test_ignore_flags.push(path);
             }
         });
         if train_images.len() != train_gt.len()
@@ -415,10 +452,14 @@ pub fn load_text_detection_tensor_files(target_dir: &str) -> Result<TextDetectio
             train_gt,
             train_mask,
             train_adj,
+            train_polys,
+            train_ignore_flags,
             test_images,
             test_gt,
             test_mask,
             test_adj,
+            test_polys,
+            test_ignore_flags,
         })
     } else {
         Err(anyhow!("The directory doesn't exist"))
@@ -436,6 +477,8 @@ pub fn generate_text_det_tensor_chunks(
     let gt_file;
     let mask_file;
     let adj_file;
+    let polys_file;
+    let ignore_flags_file;
     let window_size;
     let target_dir;
     if train {
@@ -443,6 +486,8 @@ pub fn generate_text_det_tensor_chunks(
         gt_file = get_target_filename(TEXT_DET_TRAIN_GT_FILE);
         mask_file = get_target_filename(TEXT_DET_TRAIN_MASK_FILE);
         adj_file = get_target_filename(TEXT_DET_TRAIN_ADJ_FILE);
+        polys_file = get_target_filename(TEXT_DET_TRAIN_POLYS_FILE);
+        ignore_flags_file = get_target_filename(TEXT_DET_TRAIN_IGNORE_FLAGS_FILE);
         window_size = 40;
         target_dir = "train";
     } else {
@@ -450,6 +495,8 @@ pub fn generate_text_det_tensor_chunks(
         gt_file = get_target_filename(TEXT_DET_TEST_GT_FILE);
         mask_file = get_target_filename(TEXT_DET_TEST_MASK_FILE);
         adj_file = get_target_filename(TEXT_DET_TEST_ADJ_FILE);
+        polys_file = get_target_filename(TEXT_DET_TEST_POLYS_FILE);
+        ignore_flags_file = get_target_filename(TEXT_DET_TEST_IGNORE_FLAGS_FILE);
         window_size = 10;
         target_dir = "test";
     };
@@ -464,7 +511,7 @@ pub fn generate_text_det_tensor_chunks(
             .chunks(window_size)
             .enumerate()
             .for_each(|(pos, chunk)| {
-                let (images, gts, masks, adjust_values) = chunk
+                let (images, gts, masks, adjust_values, batch_polygons, batch_ignore_flags) = chunk
                     .par_iter()
                     .fold(
                         || {
@@ -473,14 +520,33 @@ pub fn generate_text_det_tensor_chunks(
                                 Tensor::of_slice(&[0]),
                                 Tensor::of_slice(&[0]),
                                 Tensor::new(),
+                                Vec::new(),
+                                Vec::new(),
                             )
                         },
-                        |(mut im_acc, mut gt_acc, mut mask_acc, mut adjust_acc), filename| {
+                        |(
+                            mut im_acc,
+                            mut gt_acc,
+                            mut mask_acc,
+                            mut adjust_acc,
+                            mut polygons_acc,
+                            mut ignore_flags_acc,
+                        ),
+                         filename| {
                             if TEXT_DET_FILE_NAME_FORMAT_REGEX.captures(filename).is_some() {
                                 match load_text_detection_image(filename, dim) {
-                                    Ok((im, gt, mask, adj_values)) => {
+                                    Ok((im, gt, mask, adj_values, polygons, ignore_flags)) => {
+                                        polygons_acc.push(polygons);
+                                        ignore_flags_acc.push(ignore_flags);
                                         if im_acc.numel() == 1 {
-                                            return (im, gt, mask, adj_values);
+                                            return (
+                                                im,
+                                                gt,
+                                                mask,
+                                                adj_values,
+                                                polygons_acc,
+                                                ignore_flags_acc,
+                                            );
                                         }
                                         im_acc = Tensor::cat(&[im_acc, im], 0);
                                         gt_acc = Tensor::cat(&[gt_acc, gt], 0);
@@ -492,7 +558,14 @@ pub fn generate_text_det_tensor_chunks(
                                     }
                                 }
                             }
-                            (im_acc, gt_acc, mask_acc, adjust_acc)
+                            (
+                                im_acc,
+                                gt_acc,
+                                mask_acc,
+                                adjust_acc,
+                                polygons_acc,
+                                ignore_flags_acc,
+                            )
                         },
                     )
                     .reduce(
@@ -502,18 +575,45 @@ pub fn generate_text_det_tensor_chunks(
                                 Tensor::of_slice(&[0]),
                                 Tensor::of_slice(&[0]),
                                 Tensor::new(),
+                                Vec::new(),
+                                Vec::new(),
                             )
                         },
-                        |(im_acc, gt_acc, mask_acc, adj_acc),
-                         (part_im, part_gt, part_mask, part_adj)| {
+                        |(
+                            im_acc,
+                            gt_acc,
+                            mask_acc,
+                            adj_acc,
+                            mut polys_acc,
+                            mut ignore_flags_acc,
+                        ),
+                         (
+                            part_im,
+                            part_gt,
+                            part_mask,
+                            part_adj,
+                            mut part_polys,
+                            mut part_ignore_flags,
+                        )| {
+                            polys_acc.append(&mut part_polys);
+                            ignore_flags_acc.append(&mut part_ignore_flags);
                             if im_acc.numel() == 1 {
-                                return (part_im, part_gt, part_mask, part_adj);
+                                return (
+                                    part_im,
+                                    part_gt,
+                                    part_mask,
+                                    part_adj,
+                                    polys_acc,
+                                    ignore_flags_acc,
+                                );
                             }
                             (
                                 Tensor::cat(&[im_acc, part_im], 0),
                                 Tensor::cat(&[gt_acc, part_gt], 0),
                                 Tensor::cat(&[mask_acc, part_mask], 0),
                                 Tensor::cat(&[adj_acc, part_adj], 0),
+                                polys_acc,
+                                ignore_flags_acc,
                             )
                         },
                     );
@@ -540,6 +640,19 @@ pub fn generate_text_det_tensor_chunks(
                     .save(format!("{}.{}", adj_file, pos));
                 if let Err(msg) = save_res {
                     error!("Error while saving adj tensor {}", msg);
+                }
+                let save_res =
+                    save_vec_to_file(&batch_polygons, &format!("{}.{}", polys_file, pos), true);
+                if let Err(msg) = save_res {
+                    error!("Error while saving polygons vec {}", msg);
+                }
+                let save_res = save_vec_to_file(
+                    &batch_ignore_flags,
+                    &format!("{}.{}", ignore_flags_file, pos),
+                    true,
+                );
+                if let Err(msg) = save_res {
+                    error!("Error while saving ignore flags vec {}", msg);
                 }
             });
         trace!(
@@ -943,6 +1056,38 @@ pub fn get_distance(p1: &(usize, usize), p2: &(usize, usize)) -> f64 {
         .sqrt()
 }
 
+fn save_vec_to_file<T: Serialize>(value: &[T], file_path: &str, overwrite: bool) -> Result<()> {
+    if Path::new(file_path).exists() {
+        if overwrite {
+            fs::remove_file(file_path)?;
+        } else {
+            return Err(anyhow!("file {} already exists", file_path));
+        }
+    }
+    serde_json::to_writer(File::create(file_path)?, value)?;
+
+    Ok(())
+}
+
+pub fn load_polygons_vec_from_file(file_path: &str) -> Result<Vec<Vec<Vec<(u32, u32)>>>> {
+    if !Path::new(file_path).exists() {
+        return Err(anyhow!("file {} doesn't exists", file_path));
+    }
+    let reader = BufReader::new(File::open(file_path)?);
+    let value = serde_json::from_reader(reader)?;
+    Ok(value)
+}
+
+pub fn load_ignore_flags_vec_from_file(file_path: &str) -> Result<Vec<Vec<bool>>> {
+    if !Path::new(file_path).exists() {
+        return Err(anyhow!("file {} doesn't exists", file_path));
+    }
+    let file = File::open(file_path)?;
+    let reader = BufReader::new(file);
+    let value = serde_json::from_reader(reader)?;
+    Ok(value)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1118,10 +1263,14 @@ mod tests {
             TEXT_DET_TRAIN_GT_FILE,
             TEXT_DET_TRAIN_MASK_FILE,
             TEXT_DET_TRAIN_ADJ_FILE,
+            TEXT_DET_TRAIN_POLYS_FILE,
+            TEXT_DET_TRAIN_IGNORE_FLAGS_FILE,
             TEXT_DET_TEST_IMAGES_FILE,
             TEXT_DET_TEST_GT_FILE,
             TEXT_DET_TEST_MASK_FILE,
             TEXT_DET_TEST_ADJ_FILE,
+            TEXT_DET_TEST_POLYS_FILE,
+            TEXT_DET_TEST_IGNORE_FLAGS_FILE,
         ]
         .iter()
         .map(|&x| {
@@ -1235,6 +1384,45 @@ mod tests {
         for f in filenames {
             fs::remove_file(&f)?;
         }
+
+        Ok(())
+    }
+
+    #[test]
+    fn save_vec_to_file_and_load_from_file_test() -> Result<()> {
+        let polys_file_path = "test_polys_vec_file";
+        let ign_flags_file_path = "test_ign_flags_vec_file";
+
+        let polys_test_vec = vec![
+            vec![
+                // image 1
+                vec![(12, 21), (22, 21), (22, 11), (12, 11)], // poly 1
+                vec![(120, 210), (220, 210), (220, 110), (120, 110)], // poly 2
+            ],
+            vec![
+                // image 2
+                vec![(34, 43), (44, 43), (44, 33), (34, 33)], // poly 3
+                vec![(34, 43), (44, 43), (44, 33), (34, 33)], // poly 4
+            ],
+        ];
+        assert_eq!(Path::new(polys_file_path).exists(), false);
+        save_vec_to_file(&polys_test_vec, polys_file_path, true)?;
+        assert_eq!(Path::new(polys_file_path).exists(), true);
+
+        let loaded_vec = load_polygons_vec_from_file(polys_file_path)?;
+        assert_eq!(loaded_vec, polys_test_vec);
+
+        fs::remove_file(polys_file_path)?;
+
+        let ignore_flags_test_vec = vec![vec![true, false], vec![false, true]];
+        assert_eq!(Path::new(ign_flags_file_path).exists(), false);
+        save_vec_to_file(&ignore_flags_test_vec, ign_flags_file_path, true)?;
+        assert_eq!(Path::new(ign_flags_file_path).exists(), true);
+
+        let loaded_vec = load_ignore_flags_vec_from_file(ign_flags_file_path)?;
+        assert_eq!(loaded_vec, ignore_flags_test_vec);
+
+        fs::remove_file(ign_flags_file_path)?;
 
         Ok(())
     }
