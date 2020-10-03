@@ -10,7 +10,7 @@ use serde::Serialize;
 use std::cmp::Ordering;
 use std::collections::VecDeque;
 use std::f64::consts::PI;
-use std::fs::{self, File, OpenOptions};
+use std::fs::{self, File};
 use std::io::prelude::*;
 use std::io::BufReader;
 use std::path::Path;
@@ -805,7 +805,7 @@ pub fn find_contours(original_image: &GrayImage) -> Result<Vec<Vec<(usize, usize
     Ok(contours)
 }
 
-fn arc_lenght(arc: &[(usize, usize)], closed: bool) -> f64 {
+pub fn arc_lenght(arc: &[(usize, usize)], closed: bool) -> f64 {
     let mut length = arc.windows(2).fold(0., |acc, pts| {
         acc + ((pts[0].0 as f64 - pts[1].0 as f64).powf(2.)
             + (pts[0].1 as f64 - pts[1].1 as f64).powf(2.))
@@ -819,7 +819,7 @@ fn arc_lenght(arc: &[(usize, usize)], closed: bool) -> f64 {
     length
 }
 
-fn approx_poly_dp(curve: &[(usize, usize)], epsilon: f64, closed: bool) -> Vec<(usize, usize)> {
+pub fn approx_poly_dp(curve: &[(usize, usize)], epsilon: f64, closed: bool) -> Vec<(usize, usize)> {
     // Find the point with the maximum distance
     let mut dmax = 0.;
     let mut index = 0;

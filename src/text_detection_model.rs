@@ -167,14 +167,11 @@ pub fn create_and_train_model() -> Result<FuncT<'static>> {
             let image = Tensor::load(&dataset_paths.train_images[i])?;
             let gt = Tensor::load(&dataset_paths.train_gt[i])?;
             let mask = Tensor::load(&dataset_paths.train_mask[i])?;
-            let polygons = image_ops::load_polygons_vec_from_file(&dataset_paths.train_polys[i])?;
-            let ignore_flags =
-                image_ops::load_polygons_vec_from_file(&dataset_paths.train_ignore_flags[i])?;
             let pred = net.forward_t(&image, true);
             let loss = calculate_balance_loss(pred, gt, mask);
             opt.backward_step(&loss);
         }
-        let test_accuracy = get_model_accuracy(&dataset_paths, &net)?.0;
+        let test_accuracy = get_model_accuracy(&dataset_paths, &net, true)?.0;
         info!("epoch: {:4} test acc: {:5.2}%", epoch, 100. * test_accuracy,);
     }
 
@@ -217,19 +214,17 @@ fn calculate_balance_loss(pred: Tensor, gt: Tensor, mask: Tensor) -> Tensor {
 fn get_model_accuracy(
     dataset_paths: &TextDetectionDataset,
     net: &FuncT<'static>,
+    is_output_polygon: bool,
 ) -> Result<(f64, f64, f64)> {
     let mut raw_metrics = Vec::new();
     for i in 0..dataset_paths.test_images.len() {
         let images = Tensor::load(&dataset_paths.test_images[i])?;
-        let gts = Tensor::load(&dataset_paths.test_gt[i])?;
-        let masks = Tensor::load(&dataset_paths.test_mask[i])?;
         let adjs = Tensor::load(&dataset_paths.test_adj[i])?;
         let polys = image_ops::load_polygons_vec_from_file(&dataset_paths.test_polys[i])?;
         let ignore_flags =
             image_ops::load_ignore_flags_vec_from_file(&dataset_paths.test_ignore_flags[i])?;
         let pred = net.forward_t(&images, false);
-        let output = get_boxes_and_box_scores(&pred, &adjs)?;
-        // TODO: fix first 2 params (should be polygons + ignore flags)
+        let output = get_boxes_and_box_scores(&pred, &adjs, is_output_polygon)?;
         raw_metrics.push(validate_measure(
             &polys,
             &ignore_flags,
@@ -244,6 +239,7 @@ fn get_model_accuracy(
 fn get_boxes_and_box_scores(
     pred: &Tensor,
     adjust_values: &Tensor,
+    is_output_polygon: bool,
 ) -> Result<(Vec<Vec<Vec<(u32, u32)>>>, Vec<Vec<f64>>)> {
     let thresh = 0.3;
     let mut boxes_batch = Vec::new();
@@ -251,34 +247,35 @@ fn get_boxes_and_box_scores(
     let segmentation = binarize(&pred, thresh)?;
 
     for batch_index in 0..pred.size()[0] {
-        let (boxes, scores) = get_boxes_from_bitmap(
-            &pred.get(batch_index),
-            &segmentation.get(batch_index),
-            &adjust_values.get(batch_index),
-        )?;
+        let (boxes, scores) = if is_output_polygon {
+            get_polygons_from_bitmap(
+                &pred.get(batch_index),
+                &segmentation.get(batch_index),
+                &adjust_values.get(batch_index),
+            )?
+        } else {
+            get_boxes_from_bitmap(
+                &pred.get(batch_index),
+                &segmentation.get(batch_index),
+                &adjust_values.get(batch_index),
+            )?
+        };
         boxes_batch.push(boxes);
         scores_batch.push(scores);
     }
     Ok((boxes_batch, scores_batch))
 }
 
-fn binarize(pred: &Tensor, thresh: f64) -> Result<Tensor> {
-    Ok(pred.gt(thresh).to_kind(Kind::Uint8))
-}
-
-fn get_boxes_from_bitmap(
-    pred_tensor: &Tensor,
-    bitmap_tensor: &Tensor,
+fn get_polygons_from_bitmap(
+    pred: &Tensor,
+    bitmap: &Tensor,
     adjust_values: &Tensor,
 ) -> Result<(Vec<Vec<(u32, u32)>>, Vec<f64>)> {
     let max_candidates = 1000;
-    let min_size = 3.;
     let box_thresh = 0.7;
 
-    let bitmap = bitmap_tensor.get(0);
-    let pred = pred_tensor.get(0);
     // convert bitmap to GrayImage
-    let image = image_ops::convert_tensor_to_image(&(bitmap * 255))?;
+    let image = image_ops::convert_tensor_to_image(&(bitmap.get(0) * 255))?;
 
     let contours = image_ops::find_contours(&image)?;
     let num_contours = contours.len().min(max_candidates);
@@ -286,12 +283,56 @@ fn get_boxes_from_bitmap(
     let mut scores = vec![0.; num_contours];
 
     for i in 0..num_contours {
-        let contour = &contours[i];
-        let (points, sside) = get_mini_area_bounding_box(contour);
+        let epsilon = 0.01 * image_ops::arc_lenght(&contours[i], true);
+        let points = image_ops::approx_poly_dp(&contours[i], epsilon, true);
+        if points.len() < 4 {
+            continue;
+        }
+        let score = box_score_fast(&pred.get(0), &points)?;
+        if box_thresh > score {
+            continue;
+        }
+
+        boxes[i] = points.iter().fold(Vec::new(), |mut acc, p| {
+            acc.push((
+                (p.0 as f64 / adjust_values.double_value(&[0, 0])).round() as u32,
+                (p.1 as f64 / adjust_values.double_value(&[0, 1])).round() as u32,
+            ));
+            acc
+        });
+        scores[i] = score;
+    }
+
+    Ok((boxes, scores))
+}
+
+fn binarize(pred: &Tensor, thresh: f64) -> Result<Tensor> {
+    Ok(pred.gt(thresh).to_kind(Kind::Uint8))
+}
+
+fn get_boxes_from_bitmap(
+    pred: &Tensor,
+    bitmap: &Tensor,
+    adjust_values: &Tensor,
+) -> Result<(Vec<Vec<(u32, u32)>>, Vec<f64>)> {
+    let max_candidates = 1000;
+    let min_size = 3.;
+    let box_thresh = 0.7;
+
+    // convert bitmap to GrayImage
+    let image = image_ops::convert_tensor_to_image(&(bitmap.get(0) * 255))?;
+
+    let contours = image_ops::find_contours(&image)?;
+    let num_contours = contours.len().min(max_candidates);
+    let mut boxes = vec![vec![]; num_contours];
+    let mut scores = vec![0.; num_contours];
+
+    for i in 0..num_contours {
+        let (points, sside) = get_mini_area_bounding_box(&contours[i]);
         if sside < min_size {
             continue;
         }
-        let score = box_score_fast(&pred, &points)?;
+        let score = box_score_fast(&pred.get(0), &points)?;
         if box_thresh > score {
             continue;
         }
@@ -749,7 +790,7 @@ mod tests {
     }
 
     #[test]
-    fn get_boxes_from_bitmap_test_partial_match_with_no_adjustments() -> Result<()> {
+    fn get_boxes_from_bitmap_test_partial_match_without_adjustments() -> Result<()> {
         let polygons_image = open("test_data/polygon.png")?.to_luma();
         let h = polygons_image.height() as i64;
         let w = polygons_image.width() as i64;
@@ -771,6 +812,136 @@ mod tests {
         let expected_scores = vec![0., 0., 0., 0.703405017921147, 0.7521377137713772, 0.];
         assert_eq!(
             get_boxes_from_bitmap(&pred_tensor, &bitmap_tensor, &adjust_values)?,
+            (expected_boxes, expected_scores)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn get_polygons_from_bitmap_test_without_adjustments() -> Result<()> {
+        let polygons_image = open("test_data/polygon.png")?.to_luma();
+        let h = polygons_image.height() as i64;
+        let w = polygons_image.width() as i64;
+        let bit_tensor = convert_image_to_tensor(&polygons_image)?;
+        let bitmap_tensor = (&bit_tensor / 255.).to_kind(Kind::Uint8).view((1, h, w));
+
+        let pred_tensor = (convert_image_to_tensor(&polygons_image)? / 255.).view((1, h, w));
+        // no adjustment
+        let adjust_values = Tensor::of_slice(&[1., 1.]).view((1, 2));
+        let expected_boxes = vec![
+            vec![
+                (100, 20),
+                (90, 35),
+                (60, 25),
+                (90, 40),
+                (80, 55),
+                (101, 50),
+                (130, 60),
+                (115, 45),
+                (140, 30),
+                (120, 35),
+            ], // 1
+            vec![
+                (275, 20),
+                (265, 35),
+                (235, 25),
+                (265, 40),
+                (255, 55),
+                (276, 50),
+                (299, 58),
+                (299, 54),
+                (290, 45),
+                (299, 40),
+                (299, 34),
+                (295, 35),
+            ], // 2
+            vec![], // 3, it is ignored since its a triangle
+            vec![(250, 80), (250, 120), (296, 125), (299, 125), (299, 104)], // 4
+            vec![
+                (50, 181),
+                (25, 225),
+                (49, 268),
+                (100, 268),
+                (125, 225),
+                (100, 181),
+            ], // 5
+            vec![(269, 200), (240, 210), (190, 250), (220, 280)], // 6
+        ];
+        let expected_scores = vec![
+            1.0,
+            0.9980139026812314,
+            0.0,
+            0.9924146649810367,
+            1.0,
+            0.9978822532825075,
+        ];
+        assert_eq!(
+            get_polygons_from_bitmap(&pred_tensor, &bitmap_tensor, &adjust_values)?,
+            (expected_boxes, expected_scores)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn get_polygons_from_bitmap_test_with_2x_adjustments() -> Result<()> {
+        let polygons_image = open("test_data/polygon.png")?.to_luma();
+        let h = polygons_image.height() as i64;
+        let w = polygons_image.width() as i64;
+        let bit_tensor = convert_image_to_tensor(&polygons_image)?;
+        let bitmap_tensor = (&bit_tensor / 255.).to_kind(Kind::Uint8).view((1, h, w));
+
+        let pred_tensor = (convert_image_to_tensor(&polygons_image)? / 255.).view((1, h, w));
+        // resized by w x 2, h x 2
+        let adjust_values = Tensor::of_slice(&[2., 2.]).view((1, 2));
+        let expected_boxes = vec![
+            vec![
+                (50, 10),
+                (45, 18),
+                (30, 13),
+                (45, 20),
+                (40, 28),
+                (51, 25),
+                (65, 30),
+                (58, 23),
+                (70, 15),
+                (60, 18),
+            ], // 1
+            vec![
+                (138, 10),
+                (133, 18),
+                (118, 13),
+                (133, 20),
+                (128, 28),
+                (138, 25),
+                (150, 29),
+                (150, 27),
+                (145, 23),
+                (150, 20),
+                (150, 17),
+                (148, 18),
+            ], // 2
+            vec![], // 3, it is ignored since its a triangle
+            vec![(125, 40), (125, 60), (148, 63), (150, 63), (150, 52)], // 4
+            vec![
+                (25, 91),
+                (13, 113),
+                (25, 134),
+                (50, 134),
+                (63, 113),
+                (50, 91),
+            ], // 5
+            vec![(135, 100), (120, 105), (95, 125), (110, 140)], // 6
+        ];
+        let expected_scores = vec![
+            1.0,
+            0.9980139026812314,
+            0.0,
+            0.9924146649810367,
+            1.0,
+            0.9978822532825075,
+        ];
+        assert_eq!(
+            get_polygons_from_bitmap(&pred_tensor, &bitmap_tensor, &adjust_values)?,
             (expected_boxes, expected_scores)
         );
         Ok(())
