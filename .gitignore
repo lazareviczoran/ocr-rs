@@ -19,7 +19,11 @@ test_images_data_text_det.*
 test_gt_data_text_det.*
 test_mask_data_text_det.*
 test_adj_data_text_det.*
+test_polys_data_text_det.*
+test_ignore_flags_data_text_det.*
 training_images_data_text_det.*
 training_gt_data_text_det.*
 training_mask_data_text_det.*
 training_adj_data_text_det.*
+training_polys_data_text_det.*
+training_ignore_flags_data_text_det.*
