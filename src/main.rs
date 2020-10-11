@@ -1,6 +1,8 @@
 #[macro_use]
 extern crate lazy_static;
 extern crate clap;
+extern crate geo;
+extern crate geo_booleanop;
 extern crate log;
 extern crate log4rs;
 extern crate tch;
@@ -14,7 +16,7 @@ mod text_detection_model;
 mod utils;
 
 use anyhow::Result;
-use clap::{App, Arg, SubCommand};
+use clap::{App, SubCommand};
 
 const CHAR_REC_SC: &str = "char-rec";
 const TEXT_DETECTION_SC: &str = "text-detection";
@@ -60,13 +62,13 @@ fn main() -> Result<()> {
         let image_tensor =
             image_ops::load_image_as_tensor("images/test/akronim-dist-1-regular-upper-M-img.png")?;
         char_rec_conv_nn::run_prediction(&image_tensor)?;
-    // } else if let Some(matches) = matches.subcommand_matches(TEXT_DETECTION_SC) {
-    //
+    } else if let Some(_matches) = matches.subcommand_matches(TEXT_DETECTION_SC) {
+        text_detection_model::create_and_train_model()?;
     } else if let Some(_matches) = matches.subcommand_matches(IMAGE_OPS_SC) {
         // image_ops::preprocess_image("Screen Shot 2020-08-27 at 5.37.59 PM.png")?;
         // image_ops::load_text_detection_images()?;
-        image_ops::generate_text_det_tensor_chunks(image_ops::TEXT_DET_IMAGES_PATH, true)?;
-        image_ops::generate_text_det_tensor_chunks(image_ops::TEXT_DET_IMAGES_PATH, false)?;
+        image_ops::generate_text_det_tensor_chunks(image_ops::TEXT_DET_IMAGES_PATH, true, None)?;
+        image_ops::generate_text_det_tensor_chunks(image_ops::TEXT_DET_IMAGES_PATH, false, None)?;
     }
 
     Ok(())

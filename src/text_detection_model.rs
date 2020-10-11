@@ -7,13 +7,14 @@ use geo_booleanop::boolean::BooleanOp;
 use image::math::utils::clamp;
 use image::{GrayImage, Luma};
 use imageproc::drawing::{self, Point};
-use log::info;
+use log::{debug, info};
+use std::mem::drop;
 use tch::{
     nn, nn::Conv2D, nn::ConvTranspose2D, nn::FuncT, nn::ModuleT, nn::OptimizerConfig, Device, Kind,
     Reduction, Tensor,
 };
 
-const MODEL_FILENAME: &str = "text_detection_model";
+const MODEL_FILENAME: &str = "text_detection.model";
 const WHITE_COLOR: Luma<u8> = Luma([255]);
 
 fn conv2d(p: nn::Path, c_in: i64, c_out: i64, ksize: i64, padding: i64, stride: i64) -> Conv2D {
@@ -93,22 +94,22 @@ fn resnet(p: &nn::Path, c1: i64, c2: i64, c3: i64, c4: i64) -> FuncT<'static> {
 
     let inner_out = inner_in / 4;
     let out5 = nn::seq()
-        .add(conv2d(p / "out5", inner_in, inner_out, 4, 1, 3))
-        .add_fn(move |xs| xs.upsample_nearest2d(&[inner_out], 8., 8.));
+        .add(conv2d(p / "out5", inner_in, inner_out, 3, 1, 1))
+        .add_fn(move |xs| xs.upsample_nearest2d(&[xs.size()[2] * 8, xs.size()[3] * 8], None, None));
     let out4 = nn::seq()
-        .add(conv2d(p / "out4", inner_in, inner_out, 4, 1, 3))
-        .add_fn(move |xs| xs.upsample_nearest2d(&[inner_out], 4., 4.));
+        .add(conv2d(p / "out4", inner_in, inner_out, 3, 1, 1))
+        .add_fn(move |xs| xs.upsample_nearest2d(&[xs.size()[2] * 4, xs.size()[3] * 4], None, None));
     let out3 = nn::seq()
-        .add(conv2d(p / "out3", inner_in, inner_out, 4, 1, 3))
-        .add_fn(move |xs| xs.upsample_nearest2d(&[inner_out], 2., 2.));
-    let out2 = conv2d(p / "out2", inner_in, inner_out, 4, 1, 3);
+        .add(conv2d(p / "out3", inner_in, inner_out, 3, 1, 1))
+        .add_fn(move |xs| xs.upsample_nearest2d(&[xs.size()[2] * 2, xs.size()[3] * 2], None, None));
+    let out2 = conv2d(p / "out2", inner_in, inner_out, 3, 1, 1);
 
     // binarization
-    let bin_conv1 = conv2d(p / "bin_conv1", inner_in, inner_out, 4, 1, 3);
+    let bin_conv1 = conv2d(p / "bin_conv1", inner_in, inner_out, 3, 1, 1);
     let bin_bn1 = nn::batch_norm2d(p / "bin_bn1", inner_out, Default::default());
     let bin_conv_tr1 = conv_transpose2d(p / "bin_conv_tr1", inner_out, inner_out, 2, 0, 2);
     let bin_bn2 = nn::batch_norm2d(p / "bin_bn2", inner_out, Default::default());
-    let bin_conv_tr2 = conv_transpose2d(p / "bin_conv_tr2", inner_out, inner_out, 1, 2, 2);
+    let bin_conv_tr2 = conv_transpose2d(p / "bin_conv_tr2", inner_out, 1, 2, 0, 2);
 
     nn::func_t(move |xs, train| {
         // resnet part
@@ -119,18 +120,27 @@ fn resnet(p: &nn::Path, c1: i64, c2: i64, c3: i64, c4: i64) -> FuncT<'static> {
             .max_pool2d(&[3, 3], &[2, 2], &[1, 1], &[1, 1], false)
             .apply_t(&layer1, train);
         let x2 = x1.apply_t(&layer2, train);
+        let x_in2 = x1.apply_t(&in2, train);
+        drop(x1);
         let x3 = x2.apply_t(&layer3, train);
+        let x_in3 = x2.apply_t(&in3, train);
+        drop(x2);
         let x4 = x3.apply_t(&layer4, train);
-
+        let x_in4 = &x3.apply_t(&in4, train);
+        drop(x3);
         // FPN
         let x_in5 = x4.apply_t(&in5, train);
-        let x_in4 = x3.apply_t(&in4, train);
-        let x_in3 = x2.apply_t(&in3, train);
-        let x_in2 = x1.apply_t(&in2, train);
+        drop(x4);
 
-        let x_out4 = x_in5.upsample_nearest2d(&[inner_in], 2., 2.) + &x_in4;
-        let x_out3 = x_in4.upsample_nearest2d(&[inner_in], 2., 2.) + &x_in3;
-        let x_out2 = x_in3.upsample_nearest2d(&[inner_in], 2., 2.) + &x_in2;
+        let x_out2 =
+            x_in3.upsample_nearest2d(&[x_in3.size()[2] * 2, x_in3.size()[3] * 2], None, None)
+                + x_in2;
+        let x_out3 =
+            x_in4.upsample_nearest2d(&[x_in4.size()[2] * 2, x_in4.size()[3] * 2], None, None)
+                + x_in3;
+        let x_out4 =
+            x_in5.upsample_nearest2d(&[x_in5.size()[2] * 2, x_in5.size()[3] * 2], None, None)
+                + x_in4;
 
         let p5 = x_in5.apply_t(&out5, train);
         let p4 = x_out4.apply_t(&out4, train);
@@ -163,13 +173,22 @@ pub fn create_and_train_model() -> Result<FuncT<'static>> {
     let mut opt = nn::sgd(0.9, 0., 0.0001, true).build(&vs, 1e-4)?;
     // for epoch in 1..=1200 {
     for epoch in 1..=1 {
-        for i in 0..dataset_paths.train_images.len() {
-            let image = Tensor::load(&dataset_paths.train_images[i])?;
+        for i in 0..1 {
+            // for i in 0..dataset_paths.train_images.len() {
+            debug!("data batch: {}", i);
+            let image = Tensor::load(&dataset_paths.train_images[i])?
+                .view((-1, 1, 800, 800))
+                .to_kind(Kind::Float);
             let gt = Tensor::load(&dataset_paths.train_gt[i])?;
             let mask = Tensor::load(&dataset_paths.train_mask[i])?;
-            let pred = net.forward_t(&image, true);
-            let loss = calculate_balance_loss(pred, gt, mask);
-            opt.backward_step(&loss);
+            // let pred = net.forward_t(&image, true);
+            // let loss = calculate_balance_loss(pred, gt, mask);
+            for j in 0..1 {
+                // for j in 0..image.size()[0] {
+                let pred = net.forward_t(&image.get(j).view((1, 1, 800, 800)), true);
+                let loss = calculate_balance_loss(pred, gt.get(j), mask.get(j));
+                opt.backward_step(&loss);
+            }
         }
         let test_accuracy = get_model_accuracy(&dataset_paths, &net, true)?.0;
         info!("epoch: {:4} test acc: {:5.2}%", epoch, 100. * test_accuracy,);
@@ -192,15 +211,14 @@ fn calculate_balance_loss(pred: Tensor, gt: Tensor, mask: Tensor) -> Tensor {
 
     let positive = &gt * &mask;
     let negative: Tensor = (1 - &gt) * mask;
-    let positive_count = positive.sum(Kind::Int64);
+    let positive_count = positive.sum(Kind::Float);
     let negative_count = negative
-        .sum(Kind::Int64)
+        .sum(Kind::Float)
         .min1(&(&positive_count * negative_ratio));
 
-    let loss =
-        pred.binary_cross_entropy::<Tensor>(&gt.to_kind(Kind::Double), None, Reduction::None);
-    let positive_loss = &loss * positive.to_kind(Kind::Double);
-    let negative_loss_temp = loss * negative.to_kind(Kind::Double);
+    let loss = pred.binary_cross_entropy::<Tensor>(&gt.to_kind(Kind::Float), None, Reduction::None);
+    let positive_loss = &loss * positive.to_kind(Kind::Float);
+    let negative_loss_temp = loss * negative.to_kind(Kind::Float);
 
     let (negative_loss, _) =
         negative_loss_temp
@@ -217,7 +235,8 @@ fn get_model_accuracy(
     is_output_polygon: bool,
 ) -> Result<(f64, f64, f64)> {
     let mut raw_metrics = Vec::new();
-    for i in 0..dataset_paths.test_images.len() {
+    for i in 0..1 {
+        // for i in 0..dataset_paths.test_images.len() {
         let images = Tensor::load(&dataset_paths.test_images[i])?;
         let adjs = Tensor::load(&dataset_paths.test_adj[i])?;
         let polys = image_ops::load_polygons_vec_from_file(&dataset_paths.test_polys[i])?;
