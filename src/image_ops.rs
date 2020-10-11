@@ -288,7 +288,10 @@ fn load_polygons(file_path: &str) -> Result<Vec<Vec<(u32, u32)>>> {
                     .iter()
                     .flat_map(|v| v.parse())
                     .collect::<Vec<u32>>();
-                values.chunks(2).map(|point| (point[0], point[1])).collect()
+                values
+                    .chunks_exact(2)
+                    .map(|point| (point[0], point[1]))
+                    .collect()
             })
             .collect();
     } else {
@@ -519,7 +522,7 @@ pub fn generate_text_det_tensor_chunks(
                                 Tensor::of_slice(&[0]),
                                 Tensor::of_slice(&[0]),
                                 Tensor::of_slice(&[0]),
-                                Tensor::new(),
+                                Tensor::of_slice(&[0]),
                                 Vec::new(),
                                 Vec::new(),
                             )
@@ -574,7 +577,7 @@ pub fn generate_text_det_tensor_chunks(
                                 Tensor::of_slice(&[0]),
                                 Tensor::of_slice(&[0]),
                                 Tensor::of_slice(&[0]),
-                                Tensor::new(),
+                                Tensor::of_slice(&[0]),
                                 Vec::new(),
                                 Vec::new(),
                             )
@@ -603,6 +606,15 @@ pub fn generate_text_det_tensor_chunks(
                                     part_gt,
                                     part_mask,
                                     part_adj,
+                                    polys_acc,
+                                    ignore_flags_acc,
+                                );
+                            } else if part_im.numel() == 1 {
+                                return (
+                                    im_acc,
+                                    gt_acc,
+                                    mask_acc,
+                                    adj_acc,
                                     polys_acc,
                                     ignore_flags_acc,
                                 );
