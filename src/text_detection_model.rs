@@ -1,6 +1,6 @@
 use super::dataset::TextDetectionDataset;
 use super::image_ops;
-use anyhow::{anyhow, Result};
+use anyhow::Result;
 use geo::prelude::*;
 use geo::{LineString, Polygon};
 use geo_booleanop::boolean::BooleanOp;
@@ -9,6 +9,7 @@ use image::{GrayImage, Luma};
 use imageproc::drawing::{self, Point};
 use log::{debug, info};
 use std::mem::drop;
+use std::time::Instant;
 use tch::{
     nn, nn::Conv2D, nn::ConvTranspose2D, nn::FuncT, nn::ModuleT, nn::OptimizerConfig, Device, Kind,
     Reduction, Tensor,
@@ -61,10 +62,10 @@ fn basic_block(p: nn::Path, c_in: i64, c_out: i64, stride: i64) -> impl ModuleT 
     let downsample = downsample(&p / "downsample", c_in, c_out, stride);
     nn::func_t(move |xs, train| {
         let ys = xs
-            .apply(&conv1)
+            .apply_t(&conv1, train)
             .apply_t(&bn1, train)
             .relu()
-            .apply(&conv2)
+            .apply_t(&conv2, train)
             .apply_t(&bn2, train);
         (xs.apply_t(&downsample, train) + ys).relu()
     })
@@ -95,13 +96,22 @@ fn resnet(p: &nn::Path, c1: i64, c2: i64, c3: i64, c4: i64) -> FuncT<'static> {
     let inner_out = inner_in / 4;
     let out5 = nn::seq()
         .add(conv2d(p / "out5", inner_in, inner_out, 3, 1, 1))
-        .add_fn(move |xs| xs.upsample_nearest2d(&[xs.size()[2] * 8, xs.size()[3] * 8], None, None));
+        .add_fn(move |xs| {
+            let size = xs.size();
+            xs.upsample_nearest2d(&[size[2] * 8, size[3] * 8], None, None)
+        });
     let out4 = nn::seq()
         .add(conv2d(p / "out4", inner_in, inner_out, 3, 1, 1))
-        .add_fn(move |xs| xs.upsample_nearest2d(&[xs.size()[2] * 4, xs.size()[3] * 4], None, None));
+        .add_fn(move |xs| {
+            let size = xs.size();
+            xs.upsample_nearest2d(&[size[2] * 4, size[3] * 4], None, None)
+        });
     let out3 = nn::seq()
         .add(conv2d(p / "out3", inner_in, inner_out, 3, 1, 1))
-        .add_fn(move |xs| xs.upsample_nearest2d(&[xs.size()[2] * 2, xs.size()[3] * 2], None, None));
+        .add_fn(move |xs| {
+            let size = xs.size();
+            xs.upsample_nearest2d(&[size[2] * 2, size[3] * 2], None, None)
+        });
     let out2 = conv2d(p / "out2", inner_in, inner_out, 3, 1, 1);
 
     // binarization
@@ -112,9 +122,8 @@ fn resnet(p: &nn::Path, c1: i64, c2: i64, c3: i64, c4: i64) -> FuncT<'static> {
     let bin_conv_tr2 = conv_transpose2d(p / "bin_conv_tr2", inner_out, 1, 2, 0, 2);
 
     nn::func_t(move |xs, train| {
-        // resnet part
         let x1 = xs
-            .apply(&conv1)
+            .apply_t(&conv1, train)
             .apply_t(&bn1, train)
             .relu()
             .max_pool2d(&[3, 3], &[2, 2], &[1, 1], &[1, 1], false)
@@ -128,19 +137,18 @@ fn resnet(p: &nn::Path, c1: i64, c2: i64, c3: i64, c4: i64) -> FuncT<'static> {
         let x4 = x3.apply_t(&layer4, train);
         let x_in4 = &x3.apply_t(&in4, train);
         drop(x3);
-        // FPN
         let x_in5 = x4.apply_t(&in5, train);
         drop(x4);
 
+        let x_in3_size = x_in3.size();
         let x_out2 =
-            x_in3.upsample_nearest2d(&[x_in3.size()[2] * 2, x_in3.size()[3] * 2], None, None)
-                + x_in2;
+            x_in3.upsample_nearest2d(&[x_in3_size[2] * 2, x_in3_size[3] * 2], None, None) + x_in2;
+        let x_in4_size = x_in4.size();
         let x_out3 =
-            x_in4.upsample_nearest2d(&[x_in4.size()[2] * 2, x_in4.size()[3] * 2], None, None)
-                + x_in3;
+            x_in4.upsample_nearest2d(&[x_in4_size[2] * 2, x_in4_size[3] * 2], None, None) + x_in3;
+        let x_in5_size = x_in5.size();
         let x_out4 =
-            x_in5.upsample_nearest2d(&[x_in5.size()[2] * 2, x_in5.size()[3] * 2], None, None)
-                + x_in4;
+            x_in5.upsample_nearest2d(&[x_in5_size[2] * 2, x_in5_size[3] * 2], None, None) + x_in4;
 
         let p5 = x_in5.apply_t(&out5, train);
         let p4 = x_out4.apply_t(&out4, train);
@@ -171,26 +179,55 @@ pub fn create_and_train_model() -> Result<FuncT<'static>> {
     let vs = nn::VarStore::new(Device::cuda_if_available());
     let net = resnet18(&vs.root());
     let mut opt = nn::sgd(0.9, 0., 0.0001, true).build(&vs, 1e-4)?;
-    // for epoch in 1..=1200 {
-    for epoch in 1..=1 {
-        for i in 0..1 {
-            // for i in 0..dataset_paths.train_images.len() {
+    for epoch in 1..=1200 {
+        let instant = Instant::now();
+        for i in 0..dataset_paths.train_images.len() {
+            let load_instant = Instant::now();
+
             debug!("data batch: {}", i);
             let image = Tensor::load(&dataset_paths.train_images[i])?
                 .view((-1, 1, 800, 800))
                 .to_kind(Kind::Float);
             let gt = Tensor::load(&dataset_paths.train_gt[i])?;
             let mask = Tensor::load(&dataset_paths.train_mask[i])?;
+            debug!(
+                "loaded single batch in {} ms",
+                load_instant.elapsed().as_millis(),
+            );
             // let pred = net.forward_t(&image, true);
             // let loss = calculate_balance_loss(pred, gt, mask);
             for j in 0..1 {
                 // for j in 0..image.size()[0] {
+                let mut train_instant = Instant::now();
                 let pred = net.forward_t(&image.get(j).view((1, 1, 800, 800)), true);
+                debug!(
+                    "training prediction finished in {} ms",
+                    train_instant.elapsed().as_millis()
+                );
+                train_instant = Instant::now();
                 let loss = calculate_balance_loss(pred, gt.get(j), mask.get(j));
+                debug!(
+                    "loss calculation in {} ms",
+                    train_instant.elapsed().as_millis()
+                );
+                train_instant = Instant::now();
                 opt.backward_step(&loss);
+                debug!(
+                    "backward step finished in {} ms",
+                    train_instant.elapsed().as_millis()
+                );
             }
         }
+        debug!(
+            "Finished training single batch in {} ms",
+            instant.elapsed().as_millis()
+        );
+        let test_instant = Instant::now();
         let test_accuracy = get_model_accuracy(&dataset_paths, &net, true)?.0;
+        debug!(
+            "Finished test process in {} ms",
+            test_instant.elapsed().as_millis()
+        );
         info!("epoch: {:4} test acc: {:5.2}%", epoch, 100. * test_accuracy,);
     }
 
@@ -235,9 +272,10 @@ fn get_model_accuracy(
     is_output_polygon: bool,
 ) -> Result<(f64, f64, f64)> {
     let mut raw_metrics = Vec::new();
-    for i in 0..1 {
-        // for i in 0..dataset_paths.test_images.len() {
-        let images = Tensor::load(&dataset_paths.test_images[i])?;
+    for i in 0..dataset_paths.test_images.len() {
+        let images = Tensor::load(&dataset_paths.test_images[i])?
+            .view((-1, 1, 800, 800))
+            .to_kind(Kind::Float);
         let adjs = Tensor::load(&dataset_paths.test_adj[i])?;
         let polys = image_ops::load_polygons_vec_from_file(&dataset_paths.test_polys[i])?;
         let ignore_flags =
@@ -433,7 +471,7 @@ fn validate_measure(
     scores: &[Vec<f64>],
     // is_output_polygon: bool,
 ) -> Result<Vec<MetricsItem>> {
-    let is_output_polygon = false;
+    let is_output_polygon = true;
     let box_thresh = 0.6;
     let mut results = Vec::new();
     for i in 0..polygons.len() {
@@ -445,7 +483,8 @@ fn validate_measure(
         }
 
         results.push(evaluate_image(
-            (&polygons[i], &ignore_tags[i]),
+            &polygons[i],
+            &ignore_tags[i],
             &pred_polygons,
         )?);
     }
@@ -490,12 +529,12 @@ fn combine_results(results: &[MetricsItem]) -> Result<(f64, f64, f64)> {
 }
 
 fn evaluate_image(
-    gt: (&[Vec<(u32, u32)>], &[bool]),
+    gt_points: &[Vec<(u32, u32)>],
+    ignore_flags: &[bool],
     pred: &[Vec<(u32, u32)>],
 ) -> Result<MetricsItem> {
     let area_precision_constraint = 0.5;
     let iou_constraint = 0.5;
-    let (gt_points, ignore_flags) = gt;
 
     let mut det_matched = 0;
 
@@ -508,7 +547,7 @@ fn evaluate_image(
     let mut pairs = Vec::new();
     let mut det_matched_nums = Vec::new();
 
-    for n in 0..gt.0.len() {
+    for n in 0..gt_points.len() {
         let polygon = Polygon::new(
             LineString::from(
                 gt_points[n]
@@ -974,7 +1013,7 @@ mod tests {
         ];
         let ignore_polygons = [false, false];
         let pred = [vec![(1, 1), (10, 0), (10, 10), (0, 10)]];
-        let metrics = evaluate_image((&gt_polygons_tensor, &ignore_polygons), &pred)?;
+        let metrics = evaluate_image(&gt_polygons_tensor, &ignore_polygons, &pred)?;
 
         assert_eq!(metrics.gt_care, 2);
         assert_eq!(metrics.det_care, 1);
@@ -994,7 +1033,7 @@ mod tests {
         ];
         let ignore_polygons = [true, true];
         let pred = [vec![(1, 1), (10, 0), (10, 10), (0, 10)]];
-        let metrics = evaluate_image((&gt_polygons_tensor, &ignore_polygons), &pred)?;
+        let metrics = evaluate_image(&gt_polygons_tensor, &ignore_polygons, &pred)?;
 
         assert_eq!(metrics.gt_care, 0);
         assert_eq!(metrics.det_care, 0);
@@ -1017,7 +1056,7 @@ mod tests {
             vec![(1, 1), (10, 0), (10, 10), (0, 10)],
             vec![(20, 20), (30, 20), (30, 30), (20, 30)],
         ];
-        let metrics = evaluate_image((&gt_polygons_tensor, &ignore_polygons), &pred)?;
+        let metrics = evaluate_image(&gt_polygons_tensor, &ignore_polygons, &pred)?;
 
         assert_eq!(metrics.gt_care, 2);
         assert_eq!(metrics.det_care, 2);
