@@ -8,7 +8,7 @@ use rayon::prelude::*;
 use regex::Regex;
 use serde::Serialize;
 use std::cmp::Ordering;
-use std::collections::VecDeque;
+use std::collections::{BTreeSet, VecDeque};
 use std::f64::consts::PI;
 use std::fs::{self, File};
 use std::io::prelude::*;
@@ -383,46 +383,46 @@ pub fn convert_tensor_to_image(tensor: &Tensor) -> Result<GrayImage> {
 
 pub fn load_text_detection_tensor_files(target_dir: &str) -> Result<TextDetectionDataset> {
     if let Ok(files) = fs::read_dir(&target_dir) {
-        let mut train_images = Vec::new();
-        let mut train_gt = Vec::new();
-        let mut train_mask = Vec::new();
-        let mut train_adj = Vec::new();
-        let mut train_polys = Vec::new();
-        let mut train_ignore_flags = Vec::new();
-        let mut test_images = Vec::new();
-        let mut test_gt = Vec::new();
-        let mut test_mask = Vec::new();
-        let mut test_adj = Vec::new();
-        let mut test_polys = Vec::new();
-        let mut test_ignore_flags = Vec::new();
+        let mut train_images = BTreeSet::new();
+        let mut train_gt = BTreeSet::new();
+        let mut train_mask = BTreeSet::new();
+        let mut train_adj = BTreeSet::new();
+        let mut train_polys = BTreeSet::new();
+        let mut train_ignore_flags = BTreeSet::new();
+        let mut test_images = BTreeSet::new();
+        let mut test_gt = BTreeSet::new();
+        let mut test_mask = BTreeSet::new();
+        let mut test_adj = BTreeSet::new();
+        let mut test_polys = BTreeSet::new();
+        let mut test_ignore_flags = BTreeSet::new();
         files.for_each(|f| {
             let file = f.unwrap();
             let filename = file.file_name().into_string().unwrap();
             let path = file.path().display().to_string();
             if filename.starts_with(&get_target_filename(TEXT_DET_TRAIN_IMAGES_FILE)) {
-                train_images.push(path);
+                train_images.insert(path);
             } else if filename.starts_with(&get_target_filename(TEXT_DET_TRAIN_GT_FILE)) {
-                train_gt.push(path);
+                train_gt.insert(path);
             } else if filename.starts_with(&get_target_filename(TEXT_DET_TRAIN_MASK_FILE)) {
-                train_mask.push(path);
+                train_mask.insert(path);
             } else if filename.starts_with(&get_target_filename(TEXT_DET_TRAIN_ADJ_FILE)) {
-                train_adj.push(path);
+                train_adj.insert(path);
             } else if filename.starts_with(&get_target_filename(TEXT_DET_TRAIN_POLYS_FILE)) {
-                train_polys.push(path);
+                train_polys.insert(path);
             } else if filename.starts_with(&get_target_filename(TEXT_DET_TRAIN_IGNORE_FLAGS_FILE)) {
-                train_ignore_flags.push(path);
+                train_ignore_flags.insert(path);
             } else if filename.starts_with(&get_target_filename(TEXT_DET_TEST_IMAGES_FILE)) {
-                test_images.push(path);
+                test_images.insert(path);
             } else if filename.starts_with(&get_target_filename(TEXT_DET_TEST_GT_FILE)) {
-                test_gt.push(path);
+                test_gt.insert(path);
             } else if filename.starts_with(&get_target_filename(TEXT_DET_TEST_MASK_FILE)) {
-                test_mask.push(path);
+                test_mask.insert(path);
             } else if filename.starts_with(&get_target_filename(TEXT_DET_TEST_ADJ_FILE)) {
-                test_adj.push(path);
+                test_adj.insert(path);
             } else if filename.starts_with(&get_target_filename(TEXT_DET_TEST_POLYS_FILE)) {
-                test_polys.push(path);
+                test_polys.insert(path);
             } else if filename.starts_with(&get_target_filename(TEXT_DET_TEST_IGNORE_FLAGS_FILE)) {
-                test_ignore_flags.push(path);
+                test_ignore_flags.insert(path);
             }
         });
         if train_images.len() != train_gt.len()
@@ -451,18 +451,18 @@ pub fn load_text_detection_tensor_files(target_dir: &str) -> Result<TextDetectio
             );
         }
         Ok(TextDetectionDataset {
-            train_images,
-            train_gt,
-            train_mask,
-            train_adj,
-            train_polys,
-            train_ignore_flags,
-            test_images,
-            test_gt,
-            test_mask,
-            test_adj,
-            test_polys,
-            test_ignore_flags,
+            train_images: train_images.into_iter().collect(),
+            train_gt: train_gt.into_iter().collect(),
+            train_mask: train_mask.into_iter().collect(),
+            train_adj: train_adj.into_iter().collect(),
+            train_polys: train_polys.into_iter().collect(),
+            train_ignore_flags: train_ignore_flags.into_iter().collect(),
+            test_images: test_images.into_iter().collect(),
+            test_gt: test_gt.into_iter().collect(),
+            test_mask: test_mask.into_iter().collect(),
+            test_adj: test_adj.into_iter().collect(),
+            test_polys: test_polys.into_iter().collect(),
+            test_ignore_flags: test_ignore_flags.into_iter().collect(),
         })
     } else {
         Err(anyhow!("The directory doesn't exist"))
