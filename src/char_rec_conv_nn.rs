@@ -34,15 +34,15 @@ impl Net {
 impl nn::ModuleT for Net {
   fn forward_t(&self, xs: &Tensor, train: bool) -> Tensor {
     xs.view([-1, 1, 28, 28])
-      .apply(&self.conv1)
+      .apply_t(&self.conv1, train)
       .max_pool2d_default(2)
-      .apply(&self.conv2)
+      .apply_t(&self.conv2, train)
       .max_pool2d_default(2)
       .view([-1, 1024])
-      .apply(&self.fc1)
+      .apply_t(&self.fc1, train)
       .relu()
       .dropout_(0.5, train)
-      .apply(&self.fc2)
+      .apply_t(&self.fc2, train)
   }
 }
 
