@@ -2,14 +2,13 @@ use super::dataset::TextDetectionDataset;
 use super::utils::{VALUES_COUNT, VALUES_MAP};
 use anyhow::{anyhow, Result};
 use image::{imageops::FilterType, open, DynamicImage, GrayImage, ImageBuffer, Luma};
-use imageproc::drawing::{self, Point};
+use imageproc::definitions::Point;
+use imageproc::drawing::draw_polygon_mut;
 use log::{error, trace};
 use rayon::prelude::*;
 use regex::Regex;
-use serde::Serialize;
-use std::cmp::Ordering;
-use std::collections::{BTreeSet, VecDeque};
-use std::f64::consts::PI;
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
+use std::collections::BTreeSet;
 use std::fs::{self, File};
 use std::io::prelude::*;
 use std::io::BufReader;
@@ -226,7 +225,7 @@ pub fn preprocess_image(file_path: &str, target_dim: (u32, u32)) -> Result<(Gray
 }
 
 fn generate_gt_and_mask_images(
-    polygons: &[Vec<(u32, u32)>],
+    polygons: &MultiplePolygons,
     adjust_x: f64,
     adjust_y: f64,
     target_dim: (u32, u32),
@@ -234,23 +233,29 @@ fn generate_gt_and_mask_images(
     let (width, height) = target_dim;
     let mut gt_image = GrayImage::new(width, height);
     let mut mask_temp = DynamicImage::new_luma8(width, height);
-    let mut ignore_flags = vec![false; polygons.len()];
+    let mut ignore_flags = vec![false; polygons.0.len()];
     mask_temp.invert();
     let mut mask_image = mask_temp.to_luma();
-    for (pos, poly) in polygons.iter().enumerate() {
-        let num_of_points = poly.len();
-        let (min_x, max_x, min_y, max_y) = poly
-            .iter()
-            .fold((std::u32::MAX, 0, std::u32::MAX, 0), |acc, (x, y)| {
-                (acc.0.min(*x), acc.1.max(*x), acc.2.min(*y), acc.3.max(*y))
-            });
+    for (pos, poly) in polygons.0.iter().enumerate() {
+        let num_of_points = poly.points.len();
+        let (min_x, max_x, min_y, max_y) =
+            poly.points
+                .iter()
+                .fold((std::u32::MAX, 0, std::u32::MAX, 0), |acc, p| {
+                    (
+                        acc.0.min(p.x),
+                        acc.1.max(p.x),
+                        acc.2.min(p.y),
+                        acc.3.max(p.y),
+                    )
+                });
         let poly_width = max_x - min_x;
         let poly_height = max_y - min_y;
         let poly_values = (0..num_of_points)
             .map(|i| {
                 Point::new(
-                    (poly[i].0 as f64 * adjust_x) as i32,
-                    (poly[i].1 as f64 * adjust_y) as i32,
+                    (poly.points[i].x as f64 * adjust_x) as i32,
+                    (poly.points[i].y as f64 * adjust_y) as i32,
                 )
             })
             .collect::<Vec<Point<i32>>>();
@@ -259,16 +264,16 @@ fn generate_gt_and_mask_images(
             continue;
         }
         if poly_height.min(poly_width) < MIN_TEXT_SIZE {
-            drawing::draw_polygon_mut(&mut mask_image, &poly_values, BLACK_COLOR);
+            draw_polygon_mut(&mut mask_image, &poly_values, BLACK_COLOR);
             ignore_flags[pos] = true;
         } else {
-            drawing::draw_polygon_mut(&mut gt_image, &poly_values, WHITE_COLOR);
+            draw_polygon_mut(&mut gt_image, &poly_values, WHITE_COLOR);
         }
     }
     Ok((gt_image, mask_image, ignore_flags))
 }
 
-fn load_polygons(file_path: &str) -> Result<Vec<Vec<(u32, u32)>>> {
+fn load_polygons(file_path: &str) -> Result<MultiplePolygons> {
     let polygons;
     if let Ok(mut file) = File::open(file_path) {
         let mut content = String::new();
@@ -288,30 +293,25 @@ fn load_polygons(file_path: &str) -> Result<Vec<Vec<(u32, u32)>>> {
                     .iter()
                     .flat_map(|v| v.parse())
                     .collect::<Vec<u32>>();
-                values
-                    .chunks_exact(2)
-                    .map(|point| (point[0], point[1]))
-                    .collect()
+                Polygon {
+                    points: values
+                        .chunks_exact(2)
+                        .map(|point| Point::new(point[0], point[1]))
+                        .collect(),
+                }
             })
             .collect();
     } else {
         return Err(anyhow!("didn't find file {}", file_path));
     }
 
-    Ok(polygons)
+    Ok(MultiplePolygons(polygons))
 }
 
 pub fn load_text_detection_image(
     file_path: &str,
     target_dim: (u32, u32),
-) -> Result<(
-    Tensor,
-    Tensor,
-    Tensor,
-    Tensor,
-    Vec<Vec<(u32, u32)>>,
-    Vec<bool>,
-)> {
+) -> Result<(Tensor, Tensor, Tensor, Tensor, MultiplePolygons, Vec<bool>)> {
     let instant = Instant::now();
     let (preprocessed_image, adjust_x, adjust_y) = preprocess_image(file_path, target_dim)?;
 
@@ -468,6 +468,43 @@ pub fn load_text_detection_tensor_files(target_dir: &str) -> Result<TextDetectio
         Err(anyhow!("The directory doesn't exist"))
     }
 }
+
+#[derive(Serialize, Deserialize, Copy, Clone, Debug, PartialEq, Eq)]
+pub struct PointDef<T: Copy + PartialEq + Eq> {
+    pub x: T,
+    pub y: T,
+}
+impl<T: Copy + PartialEq + Eq> From<Point<T>> for PointDef<T> {
+    fn from(def: Point<T>) -> Self {
+        Self { x: def.x, y: def.y }
+    }
+}
+
+fn points_vec_ser<S: Serializer>(vec: &Vec<Point<u32>>, serializer: S) -> Result<S::Ok, S::Error> {
+    let vec2: Vec<PointDef<u32>> = vec.iter().map(|x| PointDef::from(*x)).collect();
+
+    vec2.serialize(serializer)
+}
+fn points_vec_deser<'de, D: Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Vec<Point<u32>>, D::Error> {
+    let vec: Vec<PointDef<u32>> = Deserialize::deserialize(deserializer)?;
+
+    Ok(vec.iter().map(|p| Point::<u32>::new(p.x, p.y)).collect())
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+pub struct Polygon {
+    #[serde(serialize_with = "points_vec_ser")]
+    #[serde(deserialize_with = "points_vec_deser")]
+    pub points: Vec<Point<u32>>,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+pub struct MultiplePolygons(pub Vec<Polygon>);
+
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+pub struct BatchPolygons(pub Vec<MultiplePolygons>);
 
 pub fn generate_text_det_tensor_chunks(
     images_base_dir: &str,
@@ -653,8 +690,11 @@ pub fn generate_text_det_tensor_chunks(
                 if let Err(msg) = save_res {
                     error!("Error while saving adj tensor {}", msg);
                 }
-                let save_res =
-                    save_vec_to_file(&batch_polygons, &format!("{}.{}", polys_file, pos), true);
+                let save_res = save_batch_polygons(
+                    &BatchPolygons(batch_polygons),
+                    &format!("{}.{}", polys_file, pos),
+                    true,
+                );
                 if let Err(msg) = save_res {
                     error!("Error while saving polygons vec {}", msg);
                 }
@@ -680,312 +720,6 @@ pub fn generate_text_det_tensor_chunks(
     }
 }
 
-/// Finds contours on the provided image. Works on binarized images only.
-pub fn find_contours(original_image: &GrayImage) -> Result<Vec<Vec<(usize, usize)>>> {
-    let mut nbd = 1;
-    let mut _lnbd = 1;
-    let mut pos2 = (0, 0);
-    let mut skip_tracing;
-    let mut image =
-        vec![vec![0i32; original_image.height() as usize]; original_image.width() as usize];
-
-    for y in 0..original_image.height() {
-        for x in 0..original_image.width() {
-            if original_image.get_pixel(x, y).0[0] > 0 {
-                image[x as usize][y as usize] = 1;
-            }
-        }
-    }
-    let mut neighbour_indices_diffs = VecDeque::from(vec![
-        (-1, 0),
-        (-1, -1),
-        (0, -1),
-        (1, -1),
-        (1, 0),
-        (1, 1),
-        (0, 1),
-        (-1, 1),
-    ]);
-    let mut x = 0;
-    let mut y = 0;
-    let last_pixel = (image.len() - 1, image[0].len() - 1);
-
-    let mut contours = Vec::new();
-
-    while (x, y) != last_pixel {
-        if image[x][y] != 0 {
-            skip_tracing = false;
-            if image[x][y] == 1 && x > 0 && image[x - 1][y] == 0 {
-                nbd += 1;
-                pos2 = (x - 1, y);
-            } else if image[x][y] > 0 && x < image.len() - 1 && image[x + 1][y] == 0 {
-                nbd += 1;
-                pos2 = (x + 1, y);
-                if image[x][y] > 1 {
-                    _lnbd = image[x][y];
-                }
-            } else {
-                skip_tracing = true;
-            }
-
-            if !skip_tracing {
-                let x_i32 = x as i32;
-                let y_i32 = y as i32;
-                let initial_pos_diff = (pos2.0 as i32 - x_i32, pos2.1 as i32 - y_i32);
-                let rotate_pos = neighbour_indices_diffs
-                    .iter()
-                    .position(|&x| x == initial_pos_diff)
-                    .unwrap();
-                neighbour_indices_diffs.rotate_left(rotate_pos);
-                if let Some(pos1) = neighbour_indices_diffs
-                    .iter()
-                    .find(|(x_diff, y_diff)| {
-                        let curr_x = x_i32 + *x_diff;
-                        let curr_y = y_i32 + *y_diff;
-                        curr_x > -1
-                            && curr_x < image.len() as i32
-                            && curr_y > -1
-                            && curr_y < image[0].len() as i32
-                            && image[curr_x as usize][curr_y as usize] > 0
-                    })
-                    .map(|diff| ((x as i32 + diff.0) as usize, (y as i32 + diff.1) as usize))
-                {
-                    contours.push(Vec::new());
-                    pos2 = pos1;
-                    let mut pos3 = (x, y);
-                    loop {
-                        contours[nbd as usize - 2].push(pos3);
-                        let initial_pos_diff =
-                            (pos2.0 as i32 - pos3.0 as i32, pos2.1 as i32 - pos3.1 as i32);
-                        let rotate_pos = neighbour_indices_diffs
-                            .iter()
-                            .position(|&x| x == initial_pos_diff)
-                            .unwrap();
-                        neighbour_indices_diffs.rotate_left(rotate_pos);
-                        let pos4 = neighbour_indices_diffs
-                            .iter()
-                            .rev()
-                            .find(|(x_diff, y_diff)| {
-                                let curr_x = pos3.0 as i32 + *x_diff;
-                                let curr_y = pos3.1 as i32 + *y_diff;
-                                curr_x > -1
-                                    && curr_x < image.len() as i32
-                                    && curr_y > -1
-                                    && curr_y < image[0].len() as i32
-                                    && image[curr_x as usize][curr_y as usize] != 0
-                            })
-                            .map(|diff| {
-                                (
-                                    (pos3.0 as i32 + diff.0) as usize,
-                                    (pos3.1 as i32 + diff.1) as usize,
-                                )
-                            })
-                            .unwrap();
-
-                        if pos3.0 + 1 >= image.len() || image[pos3.0 + 1][pos3.1] == 0 {
-                            image[pos3.0][pos3.1] = -nbd;
-                        }
-                        if (pos3.0 + 1 >= image.len() || image[pos3.0 + 1][pos3.1] != 0)
-                            && image[pos3.0][pos3.1] == 1
-                        {
-                            image[pos3.0][pos3.1] = nbd;
-                        }
-                        if pos4 == (x, y) && pos3 == pos1 {
-                            break;
-                        }
-                        pos2 = pos3;
-                        pos3 = pos4;
-                    }
-                } else {
-                    image[x][y] = -nbd;
-                }
-            }
-
-            if image[x][y] != 1 {
-                _lnbd = image[x][y].abs();
-            }
-        }
-        if x == last_pixel.0 {
-            x = 0;
-            y += 1;
-            _lnbd = 1;
-        } else {
-            x += 1;
-        }
-    }
-
-    Ok(contours)
-}
-
-pub fn arc_lenght(arc: &[(usize, usize)], closed: bool) -> f64 {
-    let mut length = arc.windows(2).fold(0., |acc, pts| {
-        acc + ((pts[0].0 as f64 - pts[1].0 as f64).powf(2.)
-            + (pts[0].1 as f64 - pts[1].1 as f64).powf(2.))
-        .sqrt()
-    });
-    if closed {
-        length += ((arc[0].0 as f64 - arc[arc.len() - 1].0 as f64).powf(2.)
-            + (arc[0].1 as f64 - arc[arc.len() - 1].1 as f64).powf(2.))
-        .sqrt();
-    }
-    length
-}
-
-pub fn approx_poly_dp(curve: &[(usize, usize)], epsilon: f64, closed: bool) -> Vec<(usize, usize)> {
-    // Find the point with the maximum distance
-    let mut dmax = 0.;
-    let mut index = 0;
-    let end = curve.len() - 1;
-    let line_args = line_params(&[curve[0], curve[end]]);
-    for (i, point) in curve.iter().enumerate().skip(1) {
-        let d = perpendicular_distance(line_args, *point);
-        if d > dmax {
-            index = i;
-            dmax = d;
-        }
-    }
-
-    let mut res = Vec::new();
-
-    // If max distance is greater than epsilon, recursively simplify
-    if dmax > epsilon {
-        // Recursive call
-        let mut partial1 = approx_poly_dp(&curve[0..=index], epsilon, false);
-        let mut partial2 = approx_poly_dp(&curve[index..=end], epsilon, false);
-
-        // Build the result list
-        partial1.pop();
-        res.append(&mut partial1);
-        res.append(&mut partial2);
-    } else {
-        res.push(curve[0]);
-        res.push(curve[end]);
-    }
-
-    if closed {
-        res.pop();
-    }
-
-    res
-}
-
-fn line_params(points: &[(usize, usize)]) -> (f64, f64, f64) {
-    let p1 = points[0];
-    let p2 = points[1];
-    let a = p1.1 as f64 - p2.1 as f64;
-    let b = p2.0 as f64 - p1.0 as f64;
-    let c = (p1.0 * p2.1) as f64 - (p2.0 * p1.1) as f64;
-
-    (a, b, c)
-}
-
-#[allow(clippy::many_single_char_names)]
-fn perpendicular_distance(line_args: (f64, f64, f64), point: (usize, usize)) -> f64 {
-    let (a, b, c) = line_args;
-    let (x, y) = point;
-
-    (a * x as f64 + b * y as f64 + c).abs() / (a.powf(2.) + b.powf(2.)).sqrt()
-}
-
-pub fn min_area_rect(contour: &[(usize, usize)]) -> Vec<(usize, usize)> {
-    let hull = convex_hull(&contour);
-    match hull.len() {
-        0 => panic!("no points are defined"),
-        1 => vec![hull[0]; 4],
-        2 => vec![hull[0], hull[1], hull[1], hull[0]],
-        _ => rotating_calipers(&hull),
-    }
-}
-
-fn rotating_calipers(points: &[(usize, usize)]) -> Vec<(usize, usize)> {
-    let n = points.len();
-    let edges: Vec<(f64, f64)> = (0..n - 1)
-        .map(|i| {
-            let next = i + 1;
-            (
-                points[next].0 as f64 - points[i].0 as f64,
-                points[next].1 as f64 - points[i].1 as f64,
-            )
-        })
-        .collect();
-
-    let mut edge_angles: Vec<f64> = edges
-        .iter()
-        .map(|e| ((e.1.atan2(e.0) + PI) % (PI / 2.)).abs())
-        .collect();
-    edge_angles.dedup();
-
-    let mut min_area = std::f64::MAX;
-    let mut res = vec![(0., 0.); 4];
-    for angle in edge_angles {
-        let r = [[angle.cos(), -angle.sin()], [angle.sin(), angle.cos()]];
-
-        let rotated_points: Vec<(f64, f64)> = points
-            .iter()
-            .map(|p| {
-                (
-                    p.0 as f64 * r[0][0] + p.1 as f64 * r[1][0],
-                    p.0 as f64 * r[0][1] + p.1 as f64 * r[1][1],
-                )
-            })
-            .collect();
-        let (min_x, max_x, min_y, max_y) = rotated_points.iter().fold(
-            (std::f64::MAX, std::f64::MIN, std::f64::MAX, std::f64::MIN),
-            |acc, p| {
-                (
-                    acc.0.min(p.0),
-                    acc.1.max(p.0),
-                    acc.2.min(p.1),
-                    acc.3.max(p.1),
-                )
-            },
-        );
-        let width = max_x - min_x;
-        let height = max_y - min_y;
-        let area = width * height;
-        if area < min_area {
-            min_area = area;
-
-            res[0] = (
-                max_x * r[0][0] + min_y * r[0][1],
-                max_x * r[1][0] + min_y * r[1][1],
-            );
-            res[1] = (
-                min_x * r[0][0] + min_y * r[0][1],
-                min_x * r[1][0] + min_y * r[1][1],
-            );
-            res[2] = (
-                min_x * r[0][0] + max_y * r[0][1],
-                min_x * r[1][0] + max_y * r[1][1],
-            );
-            res[3] = (
-                max_x * r[0][0] + max_y * r[0][1],
-                max_x * r[1][0] + max_y * r[1][1],
-            );
-        }
-    }
-
-    res.sort_by(|a, b| {
-        if a.0 < b.0 {
-            std::cmp::Ordering::Less
-        } else if a.0 > b.0 {
-            std::cmp::Ordering::Greater
-        } else {
-            std::cmp::Ordering::Equal
-        }
-    });
-    let i1 = if res[1].1 > res[0].1 { 0 } else { 1 };
-    let i2 = if res[3].1 > res[2].1 { 2 } else { 3 };
-    let i3 = if res[3].1 > res[2].1 { 3 } else { 2 };
-    let i4 = if res[1].1 > res[0].1 { 1 } else { 0 };
-    vec![
-        (res[i1].0.floor() as usize, res[i1].1.floor() as usize),
-        (res[i2].0.ceil() as usize, res[i2].1.floor() as usize),
-        (res[i3].0.ceil() as usize, res[i3].1.ceil() as usize),
-        (res[i4].0.floor() as usize, res[i4].1.ceil() as usize),
-    ]
-}
-
 #[cfg(test)]
 fn get_target_filename(name: &str) -> String {
     let mut s = String::from("test-");
@@ -996,76 +730,6 @@ fn get_target_filename(name: &str) -> String {
 #[cfg(not(test))]
 fn get_target_filename(name: &str) -> String {
     String::from(name)
-}
-
-///
-/// Finds points of the smallest convex polygon that contains all the contour points.
-/// https://en.wikipedia.org/wiki/Graham_scan
-///
-fn convex_hull(points_slice: &[(usize, usize)]) -> Vec<(usize, usize)> {
-    let mut points = Vec::from(points_slice);
-    let (start_point_pos, start_point) = points.iter().enumerate().fold(
-        (std::usize::MAX, (std::usize::MAX, std::usize::MAX)),
-        |(pos, p0), (i, &point)| {
-            if point.1 < p0.1 || point.1 == p0.1 && point.0 < p0.0 {
-                return (i, point);
-            }
-            (pos, p0)
-        },
-    );
-    points.swap(0, start_point_pos);
-    points.remove(0);
-    points.sort_by(|a, b| {
-        let orientation = get_orientation(&start_point, a, b);
-        if orientation == 0 {
-            if get_distance(&start_point, a) < get_distance(&start_point, b) {
-                return std::cmp::Ordering::Less;
-            }
-            return std::cmp::Ordering::Greater;
-        }
-        if orientation == 2 {
-            std::cmp::Ordering::Less
-        } else {
-            std::cmp::Ordering::Greater
-        }
-    });
-
-    let mut iter = points.iter().peekable();
-    let mut remaining_points = Vec::with_capacity(points.len());
-    while let Some(mut p) = iter.next() {
-        while iter.peek().is_some() && get_orientation(&start_point, p, iter.peek().unwrap()) == 0 {
-            p = iter.next().unwrap();
-        }
-        remaining_points.push(p);
-    }
-
-    let mut stack = vec![start_point];
-
-    for point in points.iter() {
-        while stack.len() > 1
-            && get_orientation(&stack[stack.len() - 2], &stack[stack.len() - 1], point) != 2
-        {
-            stack.pop();
-        }
-        stack.push(*point);
-    }
-    stack
-}
-
-fn get_orientation(p: &(usize, usize), q: &(usize, usize), r: &(usize, usize)) -> u8 {
-    let val = (q.1 as i32 - p.1 as i32) * (r.0 as i32 - q.0 as i32)
-        - (q.0 as i32 - p.0 as i32) * (r.1 as i32 - q.1 as i32);
-    match val.cmp(&0) {
-        Ordering::Equal => 0,   // colinear
-        Ordering::Greater => 1, // clockwise (right)
-        Ordering::Less => 2,    // counter-clockwise (left)
-    }
-}
-
-pub fn get_distance(p1: &(usize, usize), p2: &(usize, usize)) -> f64 {
-    ((p1.0 as f64 - p2.0 as f64) * (p1.0 as f64 - p2.0 as f64)
-        + (p1.1 as f64 - p2.1 as f64) * (p1.1 as f64 - p2.1 as f64))
-        .sqrt()
 }
 
 fn save_vec_to_file<T: Serialize>(value: &[T], file_path: &str, overwrite: bool) -> Result<()> {
@@ -1081,7 +745,20 @@ fn save_vec_to_file<T: Serialize>(value: &[T], file_path: &str, overwrite: bool)
     Ok(())
 }
 
-pub fn load_polygons_vec_from_file(file_path: &str) -> Result<Vec<Vec<Vec<(u32, u32)>>>> {
+fn save_batch_polygons(polygons: &BatchPolygons, file_path: &str, overwrite: bool) -> Result<()> {
+    if Path::new(file_path).exists() {
+        if overwrite {
+            fs::remove_file(file_path)?;
+        } else {
+            return Err(anyhow!("file {} already exists", file_path));
+        }
+    }
+    serde_json::to_writer(File::create(file_path)?, polygons)?;
+
+    Ok(())
+}
+
+pub fn load_polygons_vec_from_file(file_path: &str) -> Result<BatchPolygons> {
     if !Path::new(file_path).exists() {
         return Err(anyhow!("file {} doesn't exists", file_path));
     }
@@ -1105,7 +782,6 @@ mod tests {
     use super::*;
     use crate::image_ops;
     use image::open;
-    use imageproc::drawing::{draw_polygon_mut, Point};
     use tch::{Device, Tensor};
 
     #[test]
@@ -1117,95 +793,6 @@ mod tests {
             Tensor::cat(&[zeros, ones], 0).view((-1, 2, 3)),
             Tensor::of_slice(&[0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 1, 1]).view((2, 2, 3))
         );
-    }
-
-    #[test]
-    fn find_contours_test() -> Result<()> {
-        let image = open("test_data/polygon.png")?.to_luma();
-        let contours = find_contours(&image)?;
-        assert_eq!(contours.len(), 6);
-        Ok(())
-    }
-
-    #[test]
-    fn line_params_test() {
-        let p1 = (5, 7);
-        let p2 = (10, 3);
-        assert_eq!(line_params(&[p1, p2]), (4., 5., -55.));
-    }
-
-    #[test]
-    fn perpendicular_distance_test() {
-        let line_args = (8., 7., 5.);
-        let point = (2, 3);
-        assert!(perpendicular_distance(line_args, point) - 3.9510276472 < 1e-10);
-    }
-
-    #[test]
-    fn get_contours_approx_points() -> Result<()> {
-        let mut image = GrayImage::from_pixel(300, 300, Luma([0]));
-        let white = Luma([255]);
-
-        let star = vec![
-            Point::new(100, 20),
-            Point::new(120, 35),
-            Point::new(140, 30),
-            Point::new(115, 45),
-            Point::new(130, 60),
-            Point::new(100, 50),
-            Point::new(80, 55),
-            Point::new(90, 40),
-            Point::new(60, 25),
-            Point::new(90, 35),
-        ];
-        draw_polygon_mut(&mut image, &star, white);
-        let contours = find_contours(&image)?;
-        let c1_approx = approx_poly_dp(&contours[0], arc_lenght(&contours[0], true) * 0.01, true);
-        assert_eq!(
-            c1_approx,
-            vec![
-                (100, 20),
-                (90, 35),
-                (60, 25),
-                (90, 40),
-                (80, 55),
-                (101, 50),
-                (130, 60),
-                (115, 45),
-                (140, 30),
-                (120, 35)
-            ]
-        );
-        Ok(())
-    }
-
-    #[test]
-    fn get_convex_hull_points() {
-        let star = vec![
-            (100, 20),
-            (90, 35),
-            (60, 25),
-            (90, 40),
-            (80, 55),
-            (101, 50),
-            (130, 60),
-            (115, 45),
-            (140, 30),
-            (120, 35),
-        ];
-        let points = convex_hull(&star);
-        assert_eq!(
-            points,
-            [(100, 20), (140, 30), (130, 60), (80, 55), (60, 25)]
-        );
-    }
-
-    #[test]
-    fn min_area_test() {
-        assert_eq!(
-            min_area_rect(&[(100, 20), (140, 30), (130, 60), (80, 55), (60, 25)]),
-            [(60, 16), (141, 24), (137, 61), (57, 53)]
-        )
     }
 
     #[test]
@@ -1344,9 +931,9 @@ mod tests {
         );
 
         let train_polygons_vec = image_ops::load_polygons_vec_from_file(&filenames[4])?;
-        assert_eq!(train_polygons_vec.len(), 2);
-        assert_eq!(train_polygons_vec[0].len(), 4);
-        assert_eq!(train_polygons_vec[1].len(), 3);
+        assert_eq!(train_polygons_vec.0.len(), 2);
+        assert_eq!(train_polygons_vec.0[0].0.len(), 4);
+        assert_eq!(train_polygons_vec.0[1].0.len(), 3);
 
         let train_ignore_flags_vec = image_ops::load_ignore_flags_vec_from_file(&filenames[5])?;
         assert_eq!(train_ignore_flags_vec.len(), 2);
@@ -1390,9 +977,9 @@ mod tests {
         assert_eq!(test_adj_tensor.size(), [2, 2]);
 
         let test_polygons_vec = image_ops::load_polygons_vec_from_file(&filenames[10])?;
-        assert_eq!(test_polygons_vec.len(), 2);
-        assert_eq!(test_polygons_vec[0].len(), 3);
-        assert_eq!(test_polygons_vec[1].len(), 3);
+        assert_eq!(test_polygons_vec.0.len(), 2);
+        assert_eq!(test_polygons_vec.0[0].0.len(), 3);
+        assert_eq!(test_polygons_vec.0[1].0.len(), 3);
 
         let test_ignore_flags_vec = image_ops::load_ignore_flags_vec_from_file(&filenames[11])?;
         assert_eq!(test_ignore_flags_vec.len(), 2);
@@ -1426,20 +1013,48 @@ mod tests {
         let polys_file_path = "test_polys_vec_file";
         let ign_flags_file_path = "test_ign_flags_vec_file";
 
-        let polys_test_vec = vec![
-            vec![
+        let polys_test_vec = BatchPolygons(vec![
+            MultiplePolygons(vec![
                 // image 1
-                vec![(12, 21), (22, 21), (22, 11), (12, 11)], // poly 1
-                vec![(120, 210), (220, 210), (220, 110), (120, 110)], // poly 2
-            ],
-            vec![
+                image_ops::Polygon {
+                    points: vec![
+                        Point::new(12, 21),
+                        Point::new(22, 21),
+                        Point::new(22, 11),
+                        Point::new(12, 11),
+                    ],
+                }, // poly 1
+                image_ops::Polygon {
+                    points: vec![
+                        Point::new(120, 210),
+                        Point::new(220, 210),
+                        Point::new(220, 110),
+                        Point::new(120, 110),
+                    ],
+                }, // poly 2
+            ]),
+            MultiplePolygons(vec![
                 // image 2
-                vec![(34, 43), (44, 43), (44, 33), (34, 33)], // poly 3
-                vec![(34, 43), (44, 43), (44, 33), (34, 33)], // poly 4
-            ],
-        ];
+                image_ops::Polygon {
+                    points: vec![
+                        Point::new(34, 43),
+                        Point::new(44, 43),
+                        Point::new(44, 33),
+                        Point::new(34, 33),
+                    ],
+                }, // poly 3
+                image_ops::Polygon {
+                    points: vec![
+                        Point::new(34, 43),
+                        Point::new(44, 43),
+                        Point::new(44, 33),
+                        Point::new(34, 33),
+                    ],
+                }, // poly 4
+            ]),
+        ]);
         assert_eq!(Path::new(polys_file_path).exists(), false);
-        save_vec_to_file(&polys_test_vec, polys_file_path, true)?;
+        save_batch_polygons(&polys_test_vec, polys_file_path, true)?;
         assert_eq!(Path::new(polys_file_path).exists(), true);
 
         let loaded_vec = load_polygons_vec_from_file(polys_file_path)?;

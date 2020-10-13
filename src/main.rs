@@ -8,10 +8,8 @@ extern crate log4rs;
 extern crate tch;
 
 mod char_rec_conv_nn;
-mod char_rec_nn;
 mod dataset;
 mod image_ops;
-mod text_detection;
 mod text_detection_model;
 mod utils;
 
