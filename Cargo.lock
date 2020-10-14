@@ -556,7 +556,7 @@ dependencies = [
 [[package]]
 name = "imageproc"
 version = "0.21.0"
-source = "git+https://github.com/image-rs/imageproc#4e7478a74e7242d599cc63229b19555096c3612b"
+source = "git+https://github.com/image-rs/imageproc#ee8cfc938b416a365fd9b28f92fbdbd23ebe4145"
 dependencies = [
  "conv",
  "image",
