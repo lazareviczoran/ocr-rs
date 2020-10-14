@@ -1,10 +1,11 @@
 use super::image_ops;
 use super::utils;
+use super::DEVICE;
 use anyhow::Result;
 use log::{debug, info};
 use std::path::Path;
 use std::time::Instant;
-use tch::{nn, nn::ModuleT, nn::OptimizerConfig, Device, Kind, Tensor};
+use tch::{nn, nn::ModuleT, nn::OptimizerConfig, Kind, Tensor};
 
 const MODEL_FILENAME: &str = "char_rec_conv_net.model";
 
@@ -48,7 +49,7 @@ impl nn::ModuleT for Net {
 
 fn create_and_train_model() -> Result<Net> {
   let m = image_ops::load_values()?;
-  let vs = nn::VarStore::new(Device::cuda_if_available());
+  let vs = nn::VarStore::new(*DEVICE);
   let net = Net::new(&vs.root());
   let mut opt = nn::Adam::default().build(&vs, 1e-4)?;
   for epoch in 1..=100 {
@@ -75,7 +76,7 @@ pub fn run_prediction(image_tensor: &Tensor) -> Result<()> {
     net = create_and_train_model()?;
     info!("Completed the training process")
   } else {
-    let mut weights = nn::VarStore::new(Device::cuda_if_available());
+    let mut weights = nn::VarStore::new(*DEVICE);
     net = Net::new(&weights.root());
     weights.load(MODEL_FILENAME)?;
   }

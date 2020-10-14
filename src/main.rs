@@ -15,10 +15,15 @@ mod utils;
 
 use anyhow::Result;
 use clap::{App, SubCommand};
+use tch::Device;
 
 const CHAR_REC_SC: &str = "char-rec";
 const TEXT_DETECTION_SC: &str = "text-detection";
 const IMAGE_OPS_SC: &str = "image-ops";
+
+lazy_static! {
+    pub static ref DEVICE: Device = Device::cuda_if_available();
+}
 
 fn main() -> Result<()> {
     log4rs::init_file("log4rs.yml", Default::default())?;
