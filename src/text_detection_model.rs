@@ -182,7 +182,7 @@ pub fn resnet18(p: &nn::Path) -> FuncT<'static> {
 
 pub fn create_and_train_model() -> Result<FuncT<'static>> {
     let epoch_limit = 1200;
-    let dataset_paths = image_ops::load_text_detection_tensor_files("./")?;
+    let dataset_paths = image_ops::load_text_detection_tensor_files("./text_det_tensor_files")?;
 
     let mut vs = nn::VarStore::new(*DEVICE);
     let net = resnet18(&vs.root());
