@@ -480,7 +480,7 @@ impl<T: Copy + PartialEq + Eq> From<Point<T>> for PointDef<T> {
     }
 }
 
-fn points_vec_ser<S: Serializer>(vec: &Vec<Point<u32>>, serializer: S) -> Result<S::Ok, S::Error> {
+fn points_vec_ser<S: Serializer>(vec: &[Point<u32>], serializer: S) -> Result<S::Ok, S::Error> {
     let vec2: Vec<PointDef<u32>> = vec.iter().map(|x| PointDef::from(*x)).collect();
 
     vec2.serialize(serializer)

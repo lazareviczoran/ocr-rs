@@ -69,13 +69,13 @@ fn basic_block(p: nn::Path, c_in: i64, c_out: i64, stride: i64) -> impl ModuleT 
     let bn2 = nn::batch_norm2d(&p / "bn2", c_out, Default::default());
     let downsample = downsample(&p / "downsample", c_in, c_out, stride);
     nn::func_t(move |xs, train| {
-        let ys = xs
-            .apply_t(&conv1, train)
+        (xs.apply_t(&conv1, train)
             .apply_t(&bn1, train)
             .relu()
             .apply_t(&conv2, train)
-            .apply_t(&bn2, train);
-        (xs.apply_t(&downsample, train) + ys).relu()
+            .apply_t(&bn2, train)
+            + xs.apply_t(&downsample, train))
+        .relu()
     })
 }
 
@@ -89,6 +89,7 @@ fn basic_layer(p: nn::Path, c_in: i64, c_out: i64, stride: i64, cnt: i64) -> imp
 
 fn resnet(p: &nn::Path, c1: i64, c2: i64, c3: i64, c4: i64) -> FuncT<'static> {
     let inner_in = 256;
+    let inner_out = inner_in / 4;
     let conv1 = conv2d(p / "conv1", 1, 64, 7, 3, 2);
     let bn1 = nn::batch_norm2d(p / "bn1", 64, Default::default());
     let layer1 = basic_layer(p / "layer1", 64, 64, 1, c1);
@@ -101,7 +102,6 @@ fn resnet(p: &nn::Path, c1: i64, c2: i64, c3: i64, c4: i64) -> FuncT<'static> {
     let in3 = conv2d(p / "in3", 128, inner_in, 1, 0, 1);
     let in2 = conv2d(p / "in2", 64, inner_in, 1, 0, 1);
 
-    let inner_out = inner_in / 4;
     let out5 = nn::seq()
         .add(conv2d(p / "out5", inner_in, inner_out, 3, 1, 1))
         .add_fn(move |xs| {
@@ -149,19 +149,18 @@ fn resnet(p: &nn::Path, c1: i64, c2: i64, c3: i64, c4: i64) -> FuncT<'static> {
         drop(x4);
 
         let x_in3_size = x_in3.size();
-        let x_out2 =
-            x_in3.upsample_nearest2d(&[x_in3_size[2] * 2, x_in3_size[3] * 2], None, None) + x_in2;
+        let p2 = (x_in3.upsample_nearest2d(&[x_in3_size[2] * 2, x_in3_size[3] * 2], None, None)
+            + x_in2)
+            .apply_t(&out2, train);
         let x_in4_size = x_in4.size();
-        let x_out3 =
-            x_in4.upsample_nearest2d(&[x_in4_size[2] * 2, x_in4_size[3] * 2], None, None) + x_in3;
+        let p3 = (x_in4.upsample_nearest2d(&[x_in4_size[2] * 2, x_in4_size[3] * 2], None, None)
+            + x_in3)
+            .apply_t(&out3, train);
         let x_in5_size = x_in5.size();
-        let x_out4 =
-            x_in5.upsample_nearest2d(&[x_in5_size[2] * 2, x_in5_size[3] * 2], None, None) + x_in4;
-
+        let p4 = (x_in5.upsample_nearest2d(&[x_in5_size[2] * 2, x_in5_size[3] * 2], None, None)
+            + x_in4)
+            .apply_t(&out4, train);
         let p5 = x_in5.apply_t(&out5, train);
-        let p4 = x_out4.apply_t(&out4, train);
-        let p3 = x_out3.apply_t(&out3, train);
-        let p2 = x_out2.apply_t(&out2, train);
 
         let fuse = Tensor::cat(&[p5, p4, p3, p2], 1);
 
@@ -182,6 +181,7 @@ pub fn resnet18(p: &nn::Path) -> FuncT<'static> {
 }
 
 pub fn create_and_train_model() -> Result<FuncT<'static>> {
+    let epoch_limit = 1200;
     let dataset_paths = image_ops::load_text_detection_tensor_files("./")?;
 
     let mut vs = nn::VarStore::new(*DEVICE);
@@ -190,13 +190,13 @@ pub fn create_and_train_model() -> Result<FuncT<'static>> {
         vs.load(MODEL_FILENAME)?;
     }
     let mut opt = nn::sgd(0.9, 0., 0.0001, true).build(&vs, 1e-4)?;
-    for epoch in 1..=1200 {
+    for epoch in 1..=epoch_limit {
         let instant = Instant::now();
-        for i in 0..dataset_paths.train_images.len() {
+        for (i, images_batch) in dataset_paths.train_images.iter().enumerate() {
             let load_instant = Instant::now();
 
             debug!("data batch: {}", i);
-            let image = Tensor::load(&dataset_paths.train_images[i])?
+            let image = Tensor::load(&images_batch)?
                 .view((-1, 1, 800, 800))
                 .to_kind(Kind::Float);
             let gt = Tensor::load(&dataset_paths.train_gt[i])?;
@@ -205,8 +205,6 @@ pub fn create_and_train_model() -> Result<FuncT<'static>> {
                 "loaded single batch in {} ms",
                 load_instant.elapsed().as_millis(),
             );
-            // let pred = net.forward_t(&image, true);
-            // let loss = calculate_balance_loss(pred, gt, mask);
             for j in 0..image.size()[0] {
                 let mut train_instant = Instant::now();
                 let pred = net.forward_t(&image.get(j).view((1, 1, 800, 800)), true);
@@ -229,16 +227,16 @@ pub fn create_and_train_model() -> Result<FuncT<'static>> {
             "Finished training single batch in {} ms",
             instant.elapsed().as_millis()
         );
-        let test_instant = Instant::now();
-        let test_accuracy = get_model_accuracy(&dataset_paths, &net, true)?.0;
-        debug!(
-            "Finished test process in {} ms",
-            test_instant.elapsed().as_millis()
-        );
-        info!("epoch: {:4} test acc: {:5.2}%", epoch, 100. * test_accuracy,);
+        if epoch % 200 == 0 || epoch == epoch_limit {
+            let test_instant = Instant::now();
+            let test_accuracy = get_model_accuracy(&dataset_paths, &net, true)?.0;
+            debug!(
+                "Finished test process in {} ms",
+                test_instant.elapsed().as_millis()
+            );
+            info!("epoch: {:4} test acc: {:5.2}%", epoch, 100. * test_accuracy,);
+        }
     }
-
-    vs.save(MODEL_FILENAME)?;
 
     Ok(net)
 }
@@ -280,30 +278,37 @@ fn get_model_accuracy(
 ) -> Result<(f64, f64, f64)> {
     let mut raw_metrics = Vec::new();
     for i in 0..dataset_paths.test_images.len() {
-        let images = Tensor::load(&dataset_paths.test_images[i])?
+        debug!("Calculating accuracy for batch {}", i);
+        let images = Tensor::load(&dataset_paths.test_images[i])
+            .unwrap()
             .view((-1, 1, 800, 800))
             .to_kind(Kind::Float);
-        let adjs = Tensor::load(&dataset_paths.test_adj[i])?;
-        let polys = image_ops::load_polygons_vec_from_file(&dataset_paths.test_polys[i])?;
+        let adjs = Tensor::load(&dataset_paths.test_adj[i]).unwrap();
+        let polys = image_ops::load_polygons_vec_from_file(&dataset_paths.test_polys[i]).unwrap();
         let ignore_flags =
-            image_ops::load_ignore_flags_vec_from_file(&dataset_paths.test_ignore_flags[i])?;
+            image_ops::load_ignore_flags_vec_from_file(&dataset_paths.test_ignore_flags[i])
+                .unwrap();
         let mut metrics = Vec::with_capacity(images.size()[0] as usize);
         for j in 0..images.size()[0] {
             let inst = Instant::now();
+            let mut inference_instant = Instant::now();
             let pred = net.forward_t(&images.get(j).view((-1, 1, 800, 800)), false);
+            let inference_time = inference_instant.elapsed().as_millis();
+            inference_instant = Instant::now();
             let output =
-                get_boxes_and_box_scores(&pred, &adjs.get(j).view((-1, 2)), is_output_polygon)?;
-            metrics.push(validate_measure(
-                &polys,
-                &ignore_flags,
-                &output.0,
-                &output.1,
-                j as usize,
-            )?);
+                get_boxes_and_box_scores(&pred, &adjs.get(j).view((-1, 2)), is_output_polygon)
+                    .unwrap();
+            let box_scores_time = inference_instant.elapsed().as_millis();
+            inference_instant = Instant::now();
+            metrics.push(
+                validate_measure(&polys, &ignore_flags, &output.0, &output.1, j as usize).unwrap(),
+            );
+            let validate_time = inference_instant.elapsed().as_millis();
             debug!(
-                "completed validate_measure for image {} in {} ms",
+                "completed validate_measure for image {} in {} ms (inference {} ms, get_box_scores {} ms, validation {} ms",
                 j,
-                inst.elapsed().as_millis()
+                inst.elapsed().as_millis(),
+                inference_time, box_scores_time, validate_time
             );
         }
         raw_metrics.push(metrics);
@@ -349,7 +354,7 @@ fn get_polygons_from_bitmap(
 ) -> Result<(MultiplePolygons, Vec<f64>)> {
     let max_candidates = 1000;
     let box_thresh = 0.7;
-    let save_pred_to_file = true;
+    let save_pred_to_file = false;
 
     // convert bitmap to GrayImage
     let image = image_ops::convert_tensor_to_image(&(bitmap.get(0) * 255))?;
