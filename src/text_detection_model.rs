@@ -295,13 +295,13 @@ fn get_model_accuracy(
             let pred = net.forward_t(&images.get(j).view((-1, 1, 800, 800)), false);
             let inference_time = inference_instant.elapsed().as_millis();
             inference_instant = Instant::now();
-            let output =
+            let (boxes, scores) =
                 get_boxes_and_box_scores(&pred, &adjs.get(j).view((-1, 2)), is_output_polygon)
                     .unwrap();
             let box_scores_time = inference_instant.elapsed().as_millis();
             inference_instant = Instant::now();
             metrics.push(
-                validate_measure(&polys, &ignore_flags, &output.0, &output.1, j as usize).unwrap(),
+                validate_measure(&polys, &ignore_flags, &boxes, &scores, j as usize).unwrap(),
             );
             let validate_time = inference_instant.elapsed().as_millis();
             debug!(
