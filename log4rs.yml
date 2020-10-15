@@ -17,7 +17,7 @@ appenders:
       pattern: "{d(%Y-%m-%d %H:%M:%S)} {m}{n}"
 
 root:
-  level: trace
+  level: debug
   appenders:
     - stdout
     - filelog
