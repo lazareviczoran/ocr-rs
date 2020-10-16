@@ -16,3 +16,8 @@ Cargo.lock
 **/*.model
 text-detection-images/
 text_det_tensor_files/
+text_detection_results/
+
+# profiling output
+perf.data
+flamegraph.svg

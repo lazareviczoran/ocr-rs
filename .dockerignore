@@ -2,6 +2,8 @@
 **/*.rs.bk
 /images/*
 /text-detection-images/*
+/text_det_tensor_files/*
+/text_detection_results/*
 **/.DS_Store
 test_images_data
 test_labels_data

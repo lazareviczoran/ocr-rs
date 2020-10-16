@@ -360,7 +360,7 @@ fn get_polygons_from_bitmap(
     let image = image_ops::convert_tensor_to_image(&(bitmap.get(0) * 255))?;
     if save_pred_to_file {
         image.save(&format!(
-            "prediction_binarized{}.png",
+            "text_detection_results/prediction_binarized{}.png",
             COUNTER.lock().unwrap()[0]
         ))?;
         COUNTER.lock().unwrap()[0] += 1;
