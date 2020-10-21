@@ -1,7 +1,7 @@
 use super::dataset::TextDetectionDataset;
 use super::image_ops::{self, BatchPolygons, MultiplePolygons};
 use super::DEVICE;
-use anyhow::Result;
+use anyhow::{anyhow, Result};
 use geo::prelude::*;
 use geo::{LineString, Polygon};
 use geo_booleanop::boolean::BooleanOp;
@@ -180,8 +180,42 @@ pub fn resnet18(p: &nn::Path) -> FuncT<'static> {
     resnet(p, 2, 2, 2, 2)
 }
 
+pub fn run_text_detection(image_path: &str) -> Result<()> {
+    let mut instant = Instant::now();
+    let (preprocessed_image, adj_x, adj_y) = image_ops::preprocess_image(image_path, (800, 800))?;
+    debug!("preprocessed in {} ms", instant.elapsed().as_millis());
+    instant = Instant::now();
+    let mut vs = nn::VarStore::new(*DEVICE);
+    if !Path::new(MODEL_FILENAME).exists() {
+        return Err(anyhow!("Model file doesn't exist"));
+    }
+    let net = resnet18(&vs.root());
+    vs.load(MODEL_FILENAME)?;
+    debug!("loaded model in {} ms", instant.elapsed().as_millis());
+    instant = Instant::now();
+    let image_tensor =
+        image_ops::convert_image_to_tensor(&preprocessed_image)?.to_kind(Kind::Float);
+    debug!("image -> tensor in {} ms", instant.elapsed().as_millis());
+
+    instant = Instant::now();
+    let pred = net.forward_t(&image_tensor.view((1, 1, 800, 800)), false);
+    debug!("inference in {} ms", instant.elapsed().as_millis());
+
+    instant = Instant::now();
+    let pred_image = image_ops::convert_tensor_to_image(&pred.get(0).get(0))?;
+    debug!("tensor -> image in {} ms", instant.elapsed().as_millis());
+    instant = Instant::now();
+    pred_image.save("pred.png")?;
+    debug!("saved image in {} ms", instant.elapsed().as_millis());
+    instant = Instant::now();
+    let (boxes, scores) =
+        get_boxes_and_box_scores(&pred, &Tensor::of_slice(&[adj_x, adj_y]).view((1, 2)), true)?;
+    debug!("found contours in {} ms", instant.elapsed().as_millis());
+    Ok(())
+}
+
 pub fn create_and_train_model() -> Result<FuncT<'static>> {
-    let epoch_limit = 1200;
+    let epoch_limit = 1;
     let dataset_paths = image_ops::load_text_detection_tensor_files("./text_det_tensor_files")?;
 
     let mut vs = nn::VarStore::new(*DEVICE);
@@ -216,10 +250,10 @@ pub fn create_and_train_model() -> Result<FuncT<'static>> {
                 opt.backward_step(&loss);
                 let backward_time = train_instant.elapsed().as_millis();
                 debug!(
-                    "completed single training prediction in {} ms (pred {} ms, loss {} ms, backward {} ms",
-                    train_pred_time + loss_time + backward_time,
-                    train_pred_time, loss_time, backward_time
-                );
+                        "completed single training prediction in {} ms (pred {} ms, loss {} ms, backward {} ms",
+                        train_pred_time + loss_time + backward_time,
+                        train_pred_time, loss_time, backward_time
+                    );
             }
             vs.save(MODEL_FILENAME)?;
         }

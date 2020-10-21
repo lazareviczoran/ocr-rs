@@ -66,6 +66,7 @@ fn main() -> Result<()> {
             image_ops::load_image_as_tensor("images/test/akronim-dist-1-regular-upper-M-img.png")?;
         char_rec_conv_nn::run_prediction(&image_tensor)?;
     } else if let Some(_matches) = matches.subcommand_matches(TEXT_DETECTION_SC) {
+        // text_detection_model::run_text_detection("Screenshot_20200726-134601_Firefox.jpg")?;
         text_detection_model::create_and_train_model()?;
     } else if let Some(_matches) = matches.subcommand_matches(IMAGE_OPS_SC) {
         // image_ops::preprocess_image("Screen Shot 2020-08-27 at 5.37.59 PM.png")?;
