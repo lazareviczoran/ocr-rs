@@ -20,4 +20,5 @@ text_detection_results/
 
 # profiling output
 perf.data
+perf.data.old
 flamegraph.svg

@@ -370,15 +370,15 @@ pub fn convert_tensor_to_image(tensor: &Tensor) -> Result<GrayImage> {
     if size.len() > 2 {
         return Err(anyhow!("tensor must be in 2 dimensions"));
     }
-    let h = size[size.len() - 2] as usize;
-    let w = size[size.len() - 1] as usize;
-    let mut pixel_values = vec![0; w * h];
-    pixel_values.iter_mut().enumerate().for_each(|(n, val)| {
-        let y = n as i64 / w as i64;
-        let x = n as i64 - y * w as i64;
-        *val = tensor.int64_value(&[y, x]) as u8;
-    });
-    Ok(ImageBuffer::from_vec(w as u32, h as u32, pixel_values).unwrap())
+    let h = size[0] as u32;
+    let w = size[1] as u32;
+    let numel = tensor.numel();
+    let mut pixel_values = vec![0; numel];
+    tensor
+        .to_kind(Kind::Uint8)
+        .view(-1)
+        .copy_data(&mut pixel_values, numel);
+    Ok(ImageBuffer::from_vec(w, h, pixel_values).unwrap())
 }
 
 pub fn load_text_detection_tensor_files(target_dir: &str) -> Result<TextDetectionDataset> {
