@@ -9,8 +9,8 @@ RUN apt-get -y update \
     && ldconfig /usr/local/lib;
 
 # Install pytorch dependencies
-RUN wget https://download.pytorch.org/libtorch/cpu/libtorch-cxx11-abi-shared-with-deps-1.6.0%2Bcpu.zip \
-  && unzip libtorch-cxx11-abi-shared-with-deps-1.6.0+cpu.zip -d /usr/lib/;
+RUN wget https://download.pytorch.org/libtorch/cu102/libtorch-cxx11-abi-shared-with-deps-1.6.0.zip \
+  && unzip libtorch-cxx11-abi-shared-with-deps-1.6.0.zip -d /usr/lib/;
 
 ENV LIBTORCH=/usr/lib/libtorch
 ENV LD_LIBRARY_PATH=${LIBTORCH}/lib:$LD_LIBRARY_PATH
