@@ -1,6 +1,7 @@
 /target/
 **/*.rs.bk
 /images/*
+**/.DS_Store
 /text-detection-images/*
 /text_det_tensor_files/*
 /text_detection_results/*
@@ -10,3 +11,10 @@ test_labels_data
 training_images_data
 training_labels_data
 /log/*
+**/*.model
+test_data
+
+# profiling output
+perf.data
+perf.data.old
+flamegraph.svg
