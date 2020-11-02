@@ -5,12 +5,12 @@ use anyhow::{anyhow, Result};
 use geo::prelude::*;
 use geo::{LineString, Polygon};
 use geo_booleanop::boolean::BooleanOp;
-use image::math::utils::clamp;
 use image::{GrayImage, Luma};
 use imageproc::contours::{approx_poly_dp, arc_length, find_contours, get_distance, min_area_rect};
 use imageproc::definitions::Point;
 use imageproc::drawing::{self};
 use log::{debug, info};
+use num_traits::clamp;
 use std::mem::drop;
 use std::path::Path;
 use std::sync::Mutex;
@@ -208,14 +208,14 @@ pub fn run_text_detection(image_path: &str) -> Result<()> {
     pred_image.save("pred.png")?;
     debug!("saved image in {} ms", instant.elapsed().as_millis());
     instant = Instant::now();
-    let (boxes, scores) =
+    let (_boxes, _scores) =
         get_boxes_and_box_scores(&pred, &Tensor::of_slice(&[adj_x, adj_y]).view((1, 2)), true)?;
     debug!("found contours in {} ms", instant.elapsed().as_millis());
     Ok(())
 }
 
 pub fn create_and_train_model() -> Result<FuncT<'static>> {
-    let epoch_limit = 1;
+    let epoch_limit = 1200;
     let dataset_paths = image_ops::load_text_detection_tensor_files("./text_det_tensor_files")?;
 
     let mut vs = nn::VarStore::new(*DEVICE);
@@ -317,11 +317,10 @@ fn get_model_accuracy(
             .unwrap()
             .view((-1, 1, 800, 800))
             .to_kind(Kind::Float);
-        let adjs = Tensor::load(&dataset_paths.test_adj[i]).unwrap();
-        let polys = image_ops::load_polygons_vec_from_file(&dataset_paths.test_polys[i]).unwrap();
+        let adjs = Tensor::load(&dataset_paths.test_adj[i])?;
+        let polys = image_ops::load_polygons_vec_from_file(&dataset_paths.test_polys[i])?;
         let ignore_flags =
-            image_ops::load_ignore_flags_vec_from_file(&dataset_paths.test_ignore_flags[i])
-                .unwrap();
+            image_ops::load_ignore_flags_vec_from_file(&dataset_paths.test_ignore_flags[i])?;
         let mut metrics = Vec::with_capacity(images.size()[0] as usize);
         for j in 0..images.size()[0] {
             let inst = Instant::now();
