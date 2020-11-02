@@ -35,11 +35,9 @@ pub const TEXT_DET_TEST_MASK_FILE: &str = "test_mask_data_text_det";
 pub const TEXT_DET_TEST_ADJ_FILE: &str = "test_adj_data_text_det";
 pub const TEXT_DET_TEST_POLYS_FILE: &str = "test_polys_data_text_det";
 pub const TEXT_DET_TEST_IGNORE_FLAGS_FILE: &str = "test_ignore_flags_data_text_det";
-const DEFAULT_WIDTH: u32 = 800;
-const DEFAULT_HEIGHT: u32 = 800;
-const WHITE_COLOR: Luma<u8> = Luma([255]);
-const BLACK_COLOR: Luma<u8> = Luma([0]);
-const MIN_TEXT_SIZE: u32 = 8;
+pub const WHITE_COLOR: Luma<u8> = Luma([255]);
+pub const BLACK_COLOR: Luma<u8> = Luma([0]);
+pub const MIN_TEXT_SIZE: u32 = 8;
 
 lazy_static! {
     static ref CHAR_REC_FILE_NAME_FORMAT_REGEX: Regex =
@@ -509,10 +507,9 @@ pub struct BatchPolygons(pub Vec<MultiplePolygons>);
 pub fn generate_text_det_tensor_chunks(
     images_base_dir: &str,
     train: bool,
-    target_dim: Option<(u32, u32)>,
+    dim: (u32, u32),
 ) -> Result<()> {
     let instant = Instant::now();
-    let dim = target_dim.unwrap_or((DEFAULT_WIDTH, DEFAULT_HEIGHT));
     let images_file;
     let gt_file;
     let mask_file;
@@ -840,8 +837,8 @@ mod tests {
     #[test]
     fn tensor_generating_tests() -> Result<()> {
         // generate tensors
-        generate_text_det_tensor_chunks("test_data/text_det", true, None)?;
-        generate_text_det_tensor_chunks("test_data/text_det", false, None)?;
+        generate_text_det_tensor_chunks("test_data/text_det", true, (800, 800))?;
+        generate_text_det_tensor_chunks("test_data/text_det", false, (800, 800))?;
 
         // load expected images
         let train_img1 = open("test_data/preprocessed_img55.png")?.to_luma();
