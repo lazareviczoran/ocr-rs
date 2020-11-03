@@ -130,8 +130,13 @@ fn main() -> Result<()> {
                 .unwrap_or(image_ops::TEXT_DET_IMAGES_PATH);
             let target_dir = prep_matches.value_of("target-dir").unwrap_or(".");
 
-            image_ops::generate_text_det_tensor_chunks(data_dir, target_dir, true, (800, 800))?;
-            image_ops::generate_text_det_tensor_chunks(data_dir, target_dir, false, (800, 800))?;
+            let mut dimensions = (DEFAULT_WIDTH, DEFAULT_HEIGHT);
+            if let Some(dims_str) = scmd_matches.value_of("dimensions") {
+                dimensions = utils::parse_dimensions(dims_str)?;
+            }
+
+            image_ops::generate_text_det_tensor_chunks(data_dir, target_dir, true, dimensions)?;
+            image_ops::generate_text_det_tensor_chunks(data_dir, target_dir, false, dimensions)?;
         } else {
             let image_path = scmd_matches.value_of("INPUT").unwrap();
             let model_file_path = scmd_matches
