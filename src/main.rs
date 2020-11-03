@@ -10,12 +10,14 @@ extern crate tch;
 mod char_recognition;
 mod dataset;
 mod image_ops;
-mod text_detection_model;
+mod text_detection;
 mod utils;
 
 use anyhow::Result;
+use char_recognition::options::CharRecOptions;
 use clap::{App, AppSettings, SubCommand};
 use tch::Device;
+use text_detection::{options::TextDetOptions, DEFAULT_HEIGHT, DEFAULT_WIDTH};
 
 const CHAR_REC_SC: &str = "char-recognition";
 const TEXT_DETECTION_SC: &str = "text-detection";
@@ -98,46 +100,50 @@ fn main() -> Result<()> {
     if let Some(scmd_matches) = matches.subcommand_matches(CHAR_REC_SC) {
         // handling character recognition match
         if let Some(train_mathes) = scmd_matches.subcommand_matches("train") {
-            let options = char_recognition::CharRecOptions::new(train_mathes)?;
+            let options = CharRecOptions::new(train_mathes)?;
+
             char_recognition::train_model(&options)?;
         } else if let Some(prep_matches) = scmd_matches.subcommand_matches("prepare-tensors") {
             let data_dir = prep_matches
                 .value_of("data-dir")
                 .unwrap_or(image_ops::CHAR_REC_IMAGES_PATH);
             let target_dir = prep_matches.value_of("target-dir").unwrap_or(".");
+
             image_ops::generate_char_rec_tensor_files(data_dir, target_dir)?;
         } else {
             let image_path = scmd_matches.value_of("INPUT").unwrap();
             let model_file_path = scmd_matches
                 .value_of("model-file")
                 .unwrap_or(char_recognition::MODEL_FILENAME);
+
             char_recognition::run_prediction(image_path, model_file_path)?;
         }
     } else if let Some(scmd_matches) = matches.subcommand_matches(TEXT_DETECTION_SC) {
         // handling text detection match
         if let Some(train_mathes) = scmd_matches.subcommand_matches("train") {
-            let options = text_detection_model::TextDetOptions::new(train_mathes)?;
-            text_detection_model::train_model(&options)?;
+            let options = TextDetOptions::new(train_mathes)?;
+
+            text_detection::train_model(&options)?;
         } else if let Some(prep_matches) = scmd_matches.subcommand_matches("prepare-tensors") {
             let data_dir = prep_matches
                 .value_of("data-dir")
                 .unwrap_or(image_ops::TEXT_DET_IMAGES_PATH);
             let target_dir = prep_matches.value_of("target-dir").unwrap_or(".");
+
             image_ops::generate_text_det_tensor_chunks(data_dir, target_dir, true, (800, 800))?;
             image_ops::generate_text_det_tensor_chunks(data_dir, target_dir, false, (800, 800))?;
         } else {
             let image_path = scmd_matches.value_of("INPUT").unwrap();
             let model_file_path = scmd_matches
                 .value_of("model-file")
-                .unwrap_or(text_detection_model::MODEL_FILENAME);
-            let mut dimensions = (
-                text_detection_model::DEFAULT_WIDTH,
-                text_detection_model::DEFAULT_HEIGHT,
-            );
+                .unwrap_or(text_detection::MODEL_FILENAME);
+
+            let mut dimensions = (DEFAULT_WIDTH, DEFAULT_HEIGHT);
             if let Some(dims_str) = scmd_matches.value_of("dimensions") {
                 dimensions = utils::parse_dimensions(dims_str)?;
             }
-            text_detection_model::run_text_detection(image_path, model_file_path, dimensions)?;
+
+            text_detection::run_text_detection(image_path, model_file_path, dimensions)?;
         }
     }
 

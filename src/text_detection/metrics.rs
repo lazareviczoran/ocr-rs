@@ -1,8 +1,5 @@
-use super::dataset::TextDetectionDataset;
-use super::image_ops::{self, BatchPolygons, MultiplePolygons};
-use super::DEVICE;
-use crate::utils::{parse_dimensions, parse_number, save_vs};
-use anyhow::{anyhow, Result};
+use crate::image_ops::{self, BatchPolygons, MultiplePolygons};
+use anyhow::Result;
 use geo::prelude::*;
 use geo::{LineString, Polygon};
 use geo_booleanop::boolean::BooleanOp;
@@ -10,451 +7,25 @@ use image::{GrayImage, Luma};
 use imageproc::contours::{approx_poly_dp, arc_length, find_contours, get_distance, min_area_rect};
 use imageproc::definitions::{HasWhite, Point};
 use imageproc::drawing::{self};
-use log::{debug, info};
 use num_traits::clamp;
-use std::mem::drop;
-use std::path::Path;
 use std::sync::Mutex;
-use std::time::Instant;
-use tch::{
-    nn, nn::Conv2D, nn::ConvTranspose2D, nn::FuncT, nn::ModuleT, nn::OptimizerConfig, Kind,
-    Reduction, Tensor,
-};
+use tch::{Kind, Tensor};
 
-pub const MODEL_FILENAME: &str = "text_detection.model";
-const DEFAULT_TENSORS_DIR: &str = "./text_det_tensor_files";
-pub const DEFAULT_WIDTH: u32 = 800;
-pub const DEFAULT_HEIGHT: u32 = 800;
 lazy_static! {
     static ref COUNTER: Mutex<[usize; 1]> = Mutex::new([0]);
 }
 
-#[derive(Debug)]
-pub struct TextDetOptions<'a> {
-    epoch: usize,
-    model_file_path: &'a str,
-    tensor_files_dir: &'a str,
-    learning_rate: f64,
-    momentum: f64,
-    dampening: f64,
-    weight_decay: f64,
-    nesterov: bool,
-    image_dimensions: (u32, u32),
-    test_interval: usize,
-    resume: bool,
+#[derive(Copy, Clone, Debug)]
+pub struct MetricsItem {
+    precision: f64,
+    recall: f64,
+    hmean: f64,
+    gt_care: usize,
+    det_care: usize,
+    det_matched: usize,
 }
 
-impl Default for TextDetOptions<'_> {
-    fn default() -> Self {
-        Self {
-            epoch: 1200,
-            model_file_path: MODEL_FILENAME,
-            tensor_files_dir: DEFAULT_TENSORS_DIR,
-            learning_rate: 1e-4,
-            momentum: 0.9,
-            dampening: 0.,
-            weight_decay: 1e-4,
-            nesterov: true,
-            image_dimensions: (DEFAULT_WIDTH, DEFAULT_HEIGHT),
-            test_interval: 200,
-            resume: false,
-        }
-    }
-}
-impl<'a> TextDetOptions<'a> {
-    pub fn new(args: &'a clap::ArgMatches) -> Result<Self> {
-        let mut opts = Self::default();
-        if let Some(epoch_str) = args.value_of("epoch") {
-            opts.epoch = parse_number(epoch_str, "epoch")?;
-        }
-        if let Some(path) = args.value_of("model-file") {
-            opts.model_file_path = path;
-        }
-        if let Some(path) = args.value_of("tensor-files-dir") {
-            opts.tensor_files_dir = path;
-        }
-        if let Some(lr_str) = args.value_of("learning-rate") {
-            opts.learning_rate = parse_number(lr_str, "learning rate")?;
-        }
-        if let Some(momentum_str) = args.value_of("momentum") {
-            opts.momentum = parse_number(momentum_str, "momentum")?;
-        }
-        if let Some(dampening_str) = args.value_of("dampening") {
-            opts.dampening = parse_number(dampening_str, "dampening")?;
-        }
-        if let Some(wd_str) = args.value_of("weight-decay") {
-            opts.weight_decay = parse_number(wd_str, "weight decay")?;
-        }
-        if args.is_present("no-nesterov") {
-            opts.nesterov = false;
-        }
-        if let Some(dims_str) = args.value_of("dimensions") {
-            opts.image_dimensions = parse_dimensions(dims_str)?;
-        }
-        if let Some(interval_str) = args.value_of("test-interval") {
-            opts.test_interval = parse_number(interval_str, "interval")?;
-        }
-        if args.is_present("resume") {
-            opts.resume = true;
-        }
-
-        Ok(opts)
-    }
-}
-
-fn conv2d(p: nn::Path, c_in: i64, c_out: i64, ksize: i64, padding: i64, stride: i64) -> Conv2D {
-    let conv2d_cfg = nn::ConvConfig {
-        stride,
-        padding,
-        bias: false,
-        ..Default::default()
-    };
-    nn::conv2d(&p, c_in, c_out, ksize, conv2d_cfg)
-}
-
-fn conv_transpose2d(
-    p: nn::Path,
-    c_in: i64,
-    c_out: i64,
-    ksize: i64,
-    padding: i64,
-    stride: i64,
-) -> ConvTranspose2D {
-    let conv2d_cfg = nn::ConvTransposeConfig {
-        stride,
-        padding,
-        ..Default::default()
-    };
-    nn::conv_transpose2d(&p, c_in, c_out, ksize, conv2d_cfg)
-}
-
-fn downsample(p: nn::Path, c_in: i64, c_out: i64, stride: i64) -> impl ModuleT {
-    if stride != 1 || c_in != c_out {
-        nn::seq_t()
-            .add(conv2d(&p / "0", c_in, c_out, 1, 0, stride))
-            .add(nn::batch_norm2d(&p / "1", c_out, Default::default()))
-    } else {
-        nn::seq_t()
-    }
-}
-
-fn basic_block(p: nn::Path, c_in: i64, c_out: i64, stride: i64) -> impl ModuleT {
-    let conv1 = conv2d(&p / "conv1", c_in, c_out, 3, 1, stride);
-    let bn1 = nn::batch_norm2d(&p / "bn1", c_out, Default::default());
-    let conv2 = conv2d(&p / "conv2", c_out, c_out, 3, 1, 1);
-    let bn2 = nn::batch_norm2d(&p / "bn2", c_out, Default::default());
-    let downsample = downsample(&p / "downsample", c_in, c_out, stride);
-    nn::func_t(move |xs, train| {
-        (xs.apply_t(&conv1, train)
-            .apply_t(&bn1, train)
-            .relu()
-            .apply_t(&conv2, train)
-            .apply_t(&bn2, train)
-            + xs.apply_t(&downsample, train))
-        .relu()
-    })
-}
-
-fn basic_layer(p: nn::Path, c_in: i64, c_out: i64, stride: i64, cnt: i64) -> impl ModuleT {
-    let mut layer = nn::seq_t().add(basic_block(&p / "0", c_in, c_out, stride));
-    for block_index in 1..cnt {
-        layer = layer.add(basic_block(&p / &block_index.to_string(), c_out, c_out, 1))
-    }
-    layer
-}
-
-fn resnet(p: &nn::Path, c1: i64, c2: i64, c3: i64, c4: i64) -> FuncT<'static> {
-    let inner_in = 256;
-    let inner_out = inner_in / 4;
-    let conv1 = conv2d(p / "conv1", 1, 64, 7, 3, 2);
-    let bn1 = nn::batch_norm2d(p / "bn1", 64, Default::default());
-    let layer1 = basic_layer(p / "layer1", 64, 64, 1, c1);
-    let layer2 = basic_layer(p / "layer2", 64, 128, 2, c2);
-    let layer3 = basic_layer(p / "layer3", 128, 256, 2, c3);
-    let layer4 = basic_layer(p / "layer4", 256, 512, 2, c4);
-
-    let in5 = conv2d(p / "in5", 512, inner_in, 1, 0, 1);
-    let in4 = conv2d(p / "in4", 256, inner_in, 1, 0, 1);
-    let in3 = conv2d(p / "in3", 128, inner_in, 1, 0, 1);
-    let in2 = conv2d(p / "in2", 64, inner_in, 1, 0, 1);
-
-    let out5 = nn::seq()
-        .add(conv2d(p / "out5", inner_in, inner_out, 3, 1, 1))
-        .add_fn(move |xs| {
-            let size = xs.size();
-            xs.upsample_nearest2d(&[size[2] * 8, size[3] * 8], None, None)
-        });
-    let out4 = nn::seq()
-        .add(conv2d(p / "out4", inner_in, inner_out, 3, 1, 1))
-        .add_fn(move |xs| {
-            let size = xs.size();
-            xs.upsample_nearest2d(&[size[2] * 4, size[3] * 4], None, None)
-        });
-    let out3 = nn::seq()
-        .add(conv2d(p / "out3", inner_in, inner_out, 3, 1, 1))
-        .add_fn(move |xs| {
-            let size = xs.size();
-            xs.upsample_nearest2d(&[size[2] * 2, size[3] * 2], None, None)
-        });
-    let out2 = conv2d(p / "out2", inner_in, inner_out, 3, 1, 1);
-
-    // binarization
-    let bin_conv1 = conv2d(p / "bin_conv1", inner_in, inner_out, 3, 1, 1);
-    let bin_bn1 = nn::batch_norm2d(p / "bin_bn1", inner_out, Default::default());
-    let bin_conv_tr1 = conv_transpose2d(p / "bin_conv_tr1", inner_out, inner_out, 2, 0, 2);
-    let bin_bn2 = nn::batch_norm2d(p / "bin_bn2", inner_out, Default::default());
-    let bin_conv_tr2 = conv_transpose2d(p / "bin_conv_tr2", inner_out, 1, 2, 0, 2);
-
-    nn::func_t(move |xs, train| {
-        let x1 = xs
-            .apply_t(&conv1, train)
-            .apply_t(&bn1, train)
-            .relu()
-            .max_pool2d(&[3, 3], &[2, 2], &[1, 1], &[1, 1], false)
-            .apply_t(&layer1, train);
-        let x2 = x1.apply_t(&layer2, train);
-        let x_in2 = x1.apply_t(&in2, train);
-        drop(x1);
-        let x3 = x2.apply_t(&layer3, train);
-        let x_in3 = x2.apply_t(&in3, train);
-        drop(x2);
-        let x4 = x3.apply_t(&layer4, train);
-        let x_in4 = &x3.apply_t(&in4, train);
-        drop(x3);
-        let x_in5 = x4.apply_t(&in5, train);
-        drop(x4);
-
-        let x_in3_size = x_in3.size();
-        let p2 = (x_in3.upsample_nearest2d(&[x_in3_size[2] * 2, x_in3_size[3] * 2], None, None)
-            + x_in2)
-            .apply_t(&out2, train);
-        let x_in4_size = x_in4.size();
-        let p3 = (x_in4.upsample_nearest2d(&[x_in4_size[2] * 2, x_in4_size[3] * 2], None, None)
-            + x_in3)
-            .apply_t(&out3, train);
-        let x_in5_size = x_in5.size();
-        let p4 = (x_in5.upsample_nearest2d(&[x_in5_size[2] * 2, x_in5_size[3] * 2], None, None)
-            + x_in4)
-            .apply_t(&out4, train);
-        let p5 = x_in5.apply_t(&out5, train);
-
-        let fuse = Tensor::cat(&[p5, p4, p3, p2], 1);
-
-        // binarization
-        fuse.apply_t(&bin_conv1, train)
-            .apply_t(&bin_bn1, train)
-            .relu()
-            .apply_t(&bin_conv_tr1, train)
-            .apply_t(&bin_bn2, train)
-            .relu()
-            .apply_t(&bin_conv_tr2, train)
-            .sigmoid()
-    })
-}
-
-pub fn resnet18(p: &nn::Path) -> FuncT<'static> {
-    resnet(p, 2, 2, 2, 2)
-}
-
-pub fn run_text_detection(
-    image_path: &str,
-    model_file_path: &str,
-    dimensions: (u32, u32),
-) -> Result<()> {
-    let mut instant = Instant::now();
-    let (preprocessed_image, adj_x, adj_y) = image_ops::preprocess_image(image_path, dimensions)?;
-    debug!("preprocessed in {} ms", instant.elapsed().as_millis());
-    instant = Instant::now();
-    let mut vs = nn::VarStore::new(*DEVICE);
-    if !Path::new(model_file_path).exists() {
-        return Err(anyhow!("Model file doesn't exist"));
-    }
-    let net = resnet18(&vs.root());
-    vs.load(model_file_path)?;
-    debug!("loaded model in {} ms", instant.elapsed().as_millis());
-    instant = Instant::now();
-    let image_tensor =
-        image_ops::convert_image_to_tensor(&preprocessed_image)?.to_kind(Kind::Float);
-    debug!("image -> tensor in {} ms", instant.elapsed().as_millis());
-
-    instant = Instant::now();
-    let (w, h) = dimensions;
-    let pred = net.forward_t(&image_tensor.view((1, 1, h as i64, w as i64)), false);
-    debug!("inference in {} ms", instant.elapsed().as_millis());
-
-    instant = Instant::now();
-    let pred_image = image_ops::convert_tensor_to_image(&pred.get(0).get(0))?;
-    debug!("tensor -> image in {} ms", instant.elapsed().as_millis());
-    instant = Instant::now();
-    pred_image.save("pred.png")?;
-    debug!("saved image in {} ms", instant.elapsed().as_millis());
-    instant = Instant::now();
-    let (_boxes, _scores) =
-        get_boxes_and_box_scores(&pred, &Tensor::of_slice(&[adj_x, adj_y]).view((1, 2)), true)?;
-    debug!("found contours in {} ms", instant.elapsed().as_millis());
-    Ok(())
-}
-
-pub fn train_model(opts: &TextDetOptions) -> Result<FuncT<'static>> {
-    let epoch_limit = opts.epoch;
-    let dataset_paths = image_ops::load_text_detection_tensor_files(opts.tensor_files_dir)?;
-
-    let mut vs = nn::VarStore::new(*DEVICE);
-    let net = resnet18(&vs.root());
-    if opts.resume {
-        if !Path::new(opts.model_file_path).exists() {
-            return Err(anyhow!("File {} doesn't exist", opts.model_file_path));
-        }
-        vs.load(opts.model_file_path)?;
-    } else if Path::new(opts.model_file_path).exists() {
-        return Err(anyhow!(
-            "File {} already exist (use '--resume' flag to continue training on existing model, or rename/remove existing file",
-            opts.model_file_path
-        ));
-    }
-    let mut opt = nn::sgd(
-        opts.momentum,
-        opts.dampening,
-        opts.weight_decay,
-        opts.nesterov,
-    )
-    .build(&vs, opts.learning_rate)?;
-    let (w, h) = (
-        opts.image_dimensions.0 as i64,
-        opts.image_dimensions.1 as i64,
-    );
-    for epoch in 1..=epoch_limit {
-        let instant = Instant::now();
-        for (i, images_batch) in dataset_paths.train_images.iter().enumerate() {
-            let load_instant = Instant::now();
-
-            debug!("data batch: {}", i);
-            let image = Tensor::load(&images_batch)?
-                .view((-1, 1, h, w))
-                .to_kind(Kind::Float);
-            let gt = Tensor::load(&dataset_paths.train_gt[i])?;
-            let mask = Tensor::load(&dataset_paths.train_mask[i])?;
-            debug!(
-                "loaded single batch in {} ms",
-                load_instant.elapsed().as_millis(),
-            );
-            for j in 0..image.size()[0] {
-                let mut train_instant = Instant::now();
-                let pred = net.forward_t(&image.get(j).view((1, 1, h, w)), true);
-                let train_pred_time = train_instant.elapsed().as_millis();
-                train_instant = Instant::now();
-                let loss = calculate_balance_loss(pred, gt.get(j), mask.get(j));
-                let loss_time = train_instant.elapsed().as_millis();
-                train_instant = Instant::now();
-                opt.backward_step(&loss);
-                let backward_time = train_instant.elapsed().as_millis();
-                debug!(
-                        "completed single training prediction in {} ms (pred {} ms, loss {} ms, backward {} ms",
-                        train_pred_time + loss_time + backward_time,
-                        train_pred_time, loss_time, backward_time
-                    );
-            }
-            save_vs(&vs, opts.model_file_path)?;
-        }
-        debug!(
-            "Finished training single batch in {} ms",
-            instant.elapsed().as_millis()
-        );
-        if epoch % opts.test_interval == 0 || epoch == epoch_limit {
-            let test_instant = Instant::now();
-            let (precision, _recall, _hmean) =
-                get_model_accuracy(&dataset_paths, &net, true, opts.image_dimensions)?;
-            debug!(
-                "Finished test process in {} ms",
-                test_instant.elapsed().as_millis()
-            );
-            info!("epoch: {:4} test acc: {:5.2}%", epoch, 100. * precision);
-        }
-    }
-
-    Ok(net)
-}
-
-///
-/// Args:
-///     pred: shape (N, H, W), the prediction of network
-///     gt: shape (N, H, W), the target
-///     mask: shape (N, H, W), the mask indicates positive regions
-///
-fn calculate_balance_loss(pred: Tensor, gt: Tensor, mask: Tensor) -> Tensor {
-    let negative_ratio = 3.0;
-    let eps = 1e-6;
-
-    let positive = &gt * &mask;
-    let negative: Tensor = (1 - &gt) * mask;
-    let positive_count = positive.sum(Kind::Float);
-    let negative_count = negative
-        .sum(Kind::Float)
-        .min1(&(&positive_count * negative_ratio));
-
-    let loss = pred.binary_cross_entropy::<Tensor>(&gt.to_kind(Kind::Float), None, Reduction::None);
-    let positive_loss = &loss * positive.to_kind(Kind::Float);
-    let negative_loss_temp = loss * negative.to_kind(Kind::Float);
-
-    let (negative_loss, _) =
-        negative_loss_temp
-            .view(-1)
-            .topk(negative_count.int64_value(&[]), -1, true, true);
-
-    (positive_loss.sum(Kind::Double) + negative_loss.sum(Kind::Double))
-        / (positive_count.to_kind(Kind::Double) + negative_count.to_kind(Kind::Double) + eps)
-}
-
-fn get_model_accuracy(
-    dataset_paths: &TextDetectionDataset,
-    net: &FuncT<'static>,
-    is_output_polygon: bool,
-    dimensions: (u32, u32),
-) -> Result<(f64, f64, f64)> {
-    let mut raw_metrics = Vec::new();
-    let (w, h) = (dimensions.0 as i64, dimensions.1 as i64);
-    for i in 0..dataset_paths.test_images.len() {
-        debug!("Calculating accuracy for batch {}", i);
-        let images = Tensor::load(&dataset_paths.test_images[i])?
-            .view((-1, 1, h, w))
-            .to_kind(Kind::Float);
-        let adjs = Tensor::load(&dataset_paths.test_adj[i])?;
-        let polys = image_ops::load_polygons_vec_from_file(&dataset_paths.test_polys[i])?;
-        let ignore_flags =
-            image_ops::load_ignore_flags_vec_from_file(&dataset_paths.test_ignore_flags[i])?;
-        let mut metrics = Vec::with_capacity(images.size()[0] as usize);
-        for j in 0..images.size()[0] {
-            let inst = Instant::now();
-            let mut inference_instant = Instant::now();
-            let pred = net.forward_t(&images.get(j).view((-1, 1, h, w)), false);
-            let inference_time = inference_instant.elapsed().as_millis();
-            inference_instant = Instant::now();
-            let (boxes, scores) =
-                get_boxes_and_box_scores(&pred, &adjs.get(j).view((-1, 2)), is_output_polygon)?;
-            let box_scores_time = inference_instant.elapsed().as_millis();
-            inference_instant = Instant::now();
-            metrics.push(validate_measure(
-                &polys,
-                &ignore_flags,
-                &boxes,
-                &scores,
-                j as usize,
-            )?);
-            let validate_time = inference_instant.elapsed().as_millis();
-            debug!(
-                "completed validate_measure for image {} in {} ms (inference {} ms, get_box_scores {} ms, validation {} ms",
-                j,
-                inst.elapsed().as_millis(),
-                inference_time, box_scores_time, validate_time
-            );
-        }
-        raw_metrics.push(metrics);
-    }
-    let metrics = gather_measure(&raw_metrics)?;
-    Ok(metrics)
-}
-
-fn get_boxes_and_box_scores(
+pub fn get_boxes_and_box_scores(
     pred: &Tensor,
     adjust_values: &Tensor,
     is_output_polygon: bool,
@@ -484,7 +55,7 @@ fn get_boxes_and_box_scores(
     Ok((BatchPolygons(boxes_batch), scores_batch))
 }
 
-fn get_polygons_from_bitmap(
+pub fn get_polygons_from_bitmap(
     pred: &Tensor,
     bitmap: &Tensor,
     adjust_values: &Tensor,
@@ -542,11 +113,11 @@ fn get_polygons_from_bitmap(
     Ok((MultiplePolygons(boxes), scores))
 }
 
-fn binarize(pred: &Tensor, thresh: f64) -> Result<Tensor> {
+pub fn binarize(pred: &Tensor, thresh: f64) -> Result<Tensor> {
     Ok(pred.gt(thresh).to_kind(Kind::Uint8))
 }
 
-fn get_boxes_from_bitmap(
+pub fn get_boxes_from_bitmap(
     pred: &Tensor,
     bitmap: &Tensor,
     adjust_values: &Tensor,
@@ -589,7 +160,7 @@ fn get_boxes_from_bitmap(
     Ok((MultiplePolygons(boxes), scores))
 }
 
-fn get_mini_area_bounding_box(contour: &[Point<u32>]) -> (Vec<Point<u32>>, f64) {
+pub fn get_mini_area_bounding_box(contour: &[Point<u32>]) -> (Vec<Point<u32>>, f64) {
     let mut b_box = min_area_rect(contour);
     b_box.sort_by(|a, b| a.x.cmp(&b.x));
     let i1 = if b_box[1].y > b_box[0].y { 0 } else { 1 };
@@ -603,7 +174,7 @@ fn get_mini_area_bounding_box(contour: &[Point<u32>]) -> (Vec<Point<u32>>, f64) 
     (res, w.min(h))
 }
 
-fn box_score_fast(bitmap: &Tensor, points: &[Point<u32>]) -> Result<f64> {
+pub fn box_score_fast(bitmap: &Tensor, points: &[Point<u32>]) -> Result<f64> {
     let size = bitmap.size();
     let w = size[size.len() - 2] as u32;
     let h = size[size.len() - 1] as u32;
@@ -646,7 +217,7 @@ fn box_score_fast(bitmap: &Tensor, points: &[Point<u32>]) -> Result<f64> {
 //      ignore_tags: tensor of shape (N, K), indicates whether a region is ignorable or not.
 //      pred: vector of length N of predicted polygons (each tensor of shape (M, 2) coresponds to a single image)
 //      scores: vector of length N of predicted polygons scores
-fn validate_measure(
+pub fn validate_measure(
     polygons: &BatchPolygons,
     ignore_tags: &[Vec<bool>],
     pred: &BatchPolygons,
@@ -670,7 +241,7 @@ fn validate_measure(
     )
 }
 
-fn gather_measure(metrics: &[Vec<MetricsItem>]) -> Result<(f64, f64, f64)> {
+pub fn gather_measure(metrics: &[Vec<MetricsItem>]) -> Result<(f64, f64, f64)> {
     let raw_metrics = metrics.iter().fold(Vec::new(), |mut acc, batch_metrics| {
         acc.append(&mut batch_metrics.to_vec());
         acc
@@ -679,7 +250,7 @@ fn gather_measure(metrics: &[Vec<MetricsItem>]) -> Result<(f64, f64, f64)> {
     Ok(combine_results(&raw_metrics)?)
 }
 
-fn combine_results(results: &[MetricsItem]) -> Result<(f64, f64, f64)> {
+pub fn combine_results(results: &[MetricsItem]) -> Result<(f64, f64, f64)> {
     let mut num_global_care_gt = 0;
     let mut num_global_care_det = 0;
     let mut matched_sum = 0;
@@ -707,7 +278,7 @@ fn combine_results(results: &[MetricsItem]) -> Result<(f64, f64, f64)> {
     Ok((method_precision, method_recall, method_hmean))
 }
 
-fn evaluate_image(
+pub fn evaluate_image(
     gt_points: &MultiplePolygons,
     ignore_flags: &[bool],
     pred: &MultiplePolygons,
@@ -846,23 +417,12 @@ fn get_intersection_over_union(poly1: &Polygon<f64>, poly2: &Polygon<f64>) -> Re
     Ok(get_intersection(poly1, poly2)? / get_union(poly1, poly2)?)
 }
 
-#[derive(Copy, Clone, Debug)]
-struct MetricsItem {
-    precision: f64,
-    recall: f64,
-    hmean: f64,
-    gt_care: usize,
-    det_care: usize,
-    det_matched: usize,
-}
-
 #[cfg(test)]
 mod tests {
     use super::image_ops::convert_image_to_tensor;
     use super::*;
     use image::open;
     use imageproc::drawing::draw_polygon_mut;
-    const ERROR_THRESHOLD: f64 = 1e-10;
 
     #[test]
     fn get_mini_area_bounding_box_test() {
@@ -881,7 +441,7 @@ mod tests {
                 Point::new(57, 54)
             ]
         );
-        assert!(res.1 - 39.11521443121589 < ERROR_THRESHOLD);
+        assert!((res.1 - 39.11521443121589).abs() < f64::EPSILON);
     }
 
     #[test]
@@ -1349,9 +909,9 @@ mod tests {
         assert_eq!(metrics.gt_care, 2);
         assert_eq!(metrics.det_care, 1);
         assert_eq!(metrics.det_matched, 1);
-        assert!(metrics.precision - 1. < ERROR_THRESHOLD);
-        assert!(metrics.recall - 0.5 < ERROR_THRESHOLD);
-        assert!(metrics.hmean - 0.6666666666666666 < ERROR_THRESHOLD);
+        assert!((metrics.precision - 1.).abs() < f64::EPSILON);
+        assert!((metrics.recall - 0.5).abs() < f64::EPSILON);
+        assert!((metrics.hmean - 0.6666666666666666).abs() < f64::EPSILON);
 
         Ok(())
     }
@@ -1390,9 +950,9 @@ mod tests {
         assert_eq!(metrics.gt_care, 0);
         assert_eq!(metrics.det_care, 0);
         assert_eq!(metrics.det_matched, 0);
-        assert!(metrics.precision - 1. < ERROR_THRESHOLD);
-        assert!(metrics.recall - 1. < ERROR_THRESHOLD);
-        assert!(metrics.hmean - 1. < ERROR_THRESHOLD);
+        assert!((metrics.precision - 1.).abs() < f64::EPSILON);
+        assert!((metrics.recall - 1.).abs() < f64::EPSILON);
+        assert!((metrics.hmean - 1.).abs() < f64::EPSILON);
 
         Ok(())
     }
@@ -1441,9 +1001,9 @@ mod tests {
         assert_eq!(metrics.gt_care, 2);
         assert_eq!(metrics.det_care, 2);
         assert_eq!(metrics.det_matched, 2);
-        assert!(metrics.precision - 1. < ERROR_THRESHOLD);
-        assert!(metrics.recall - 1. < ERROR_THRESHOLD);
-        assert!(metrics.hmean - 1. < ERROR_THRESHOLD);
+        assert!((metrics.precision - 1.).abs() < f64::EPSILON);
+        assert!((metrics.recall - 1.).abs() < f64::EPSILON);
+        assert!((metrics.hmean - 1.).abs() < f64::EPSILON);
 
         Ok(())
     }
