@@ -511,6 +511,7 @@ pub struct BatchPolygons(pub Vec<MultiplePolygons>);
 
 pub fn generate_text_det_tensor_chunks(
     images_base_dir: &str,
+    target_dir: &str,
     train: bool,
     dim: (u32, u32),
 ) -> Result<()> {
@@ -522,7 +523,7 @@ pub fn generate_text_det_tensor_chunks(
     let polys_file;
     let ignore_flags_file;
     let window_size;
-    let target_dir;
+    let images_dir;
     if train {
         images_file = get_target_filename(TEXT_DET_TRAIN_IMAGES_FILE);
         gt_file = get_target_filename(TEXT_DET_TRAIN_GT_FILE);
@@ -531,7 +532,7 @@ pub fn generate_text_det_tensor_chunks(
         polys_file = get_target_filename(TEXT_DET_TRAIN_POLYS_FILE);
         ignore_flags_file = get_target_filename(TEXT_DET_TRAIN_IGNORE_FLAGS_FILE);
         window_size = 40;
-        target_dir = "train";
+        images_dir = format!("{}/images/{}", images_base_dir, "train");
     } else {
         images_file = get_target_filename(TEXT_DET_TEST_IMAGES_FILE);
         gt_file = get_target_filename(TEXT_DET_TEST_GT_FILE);
@@ -540,10 +541,9 @@ pub fn generate_text_det_tensor_chunks(
         polys_file = get_target_filename(TEXT_DET_TEST_POLYS_FILE);
         ignore_flags_file = get_target_filename(TEXT_DET_TEST_IGNORE_FLAGS_FILE);
         window_size = 10;
-        target_dir = "test";
+        images_dir = format!("{}/images/{}", images_base_dir, "test");
     };
 
-    let images_dir = format!("{}/images/{}", images_base_dir, target_dir);
     if let Ok(files) = fs::read_dir(&images_dir) {
         let filenames: Vec<String> = files
             .map(|f| f.unwrap().path().display().to_string())
@@ -670,35 +670,35 @@ pub fn generate_text_det_tensor_chunks(
                     );
                 let mut save_res = save_tensor(
                     &images.view((-1, dim.0 as i64, dim.1 as i64)),
-                    &format!("{}.{}", images_file, pos),
+                    &format!("{}/{}.{}", target_dir, images_file, pos),
                 );
                 if let Err(msg) = save_res {
                     error!("Error while saving image tensor {}", msg);
                 }
                 save_res = save_tensor(
                     &gts.view((-1, dim.0 as i64, dim.1 as i64)),
-                    &format!("{}.{}", gt_file, pos),
+                    &format!("{}/{}.{}", target_dir, gt_file, pos),
                 );
                 if let Err(msg) = save_res {
                     error!("Error while saving gt tensor {}", msg);
                 }
                 save_res = save_tensor(
                     &masks.view((-1, dim.0 as i64, dim.1 as i64)),
-                    &format!("{}.{}", mask_file, pos),
+                    &format!("{}/{}.{}", target_dir, mask_file, pos),
                 );
                 if let Err(msg) = save_res {
                     error!("Error while saving mask tensor {}", msg);
                 }
                 save_res = save_tensor(
                     &adjust_values.view((-1, 2)),
-                    &format!("{}.{}", adj_file, pos),
+                    &format!("{}/{}.{}", target_dir, adj_file, pos),
                 );
                 if let Err(msg) = save_res {
                     error!("Error while saving adj tensor {}", msg);
                 }
                 let save_res = save_batch_polygons(
                     &BatchPolygons(batch_polygons),
-                    &format!("{}.{}", polys_file, pos),
+                    &format!("{}/{}.{}", target_dir, polys_file, pos),
                     true,
                 );
                 if let Err(msg) = save_res {
@@ -706,7 +706,7 @@ pub fn generate_text_det_tensor_chunks(
                 }
                 let save_res = save_vec_to_file(
                     &batch_ignore_flags,
-                    &format!("{}.{}", ignore_flags_file, pos),
+                    &format!("{}/{}.{}", target_dir, ignore_flags_file, pos),
                     true,
                 );
                 if let Err(msg) = save_res {
@@ -717,7 +717,10 @@ pub fn generate_text_det_tensor_chunks(
             "finished generating tensors in {} ms",
             instant.elapsed().as_millis()
         );
-        info!("Successfully generated tensor files!");
+        info!(
+            "Successfully generated {} tensor files!",
+            if train { "train" } else { "test" }
+        );
         Ok(())
     } else {
         Err(anyhow!(
@@ -847,8 +850,8 @@ mod tests {
     #[test]
     fn tensor_generating_tests() -> Result<()> {
         // generate tensors
-        generate_text_det_tensor_chunks("test_data/text_det", true, (800, 800))?;
-        generate_text_det_tensor_chunks("test_data/text_det", false, (800, 800))?;
+        generate_text_det_tensor_chunks("test_data/text_det", ".", true, (800, 800))?;
+        generate_text_det_tensor_chunks("test_data/text_det", ".", false, (800, 800))?;
 
         // load expected images
         let train_img1 = open("test_data/preprocessed_img55.png")?.to_luma();

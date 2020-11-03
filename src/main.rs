@@ -123,16 +123,8 @@ fn main() -> Result<()> {
                 .value_of("data-dir")
                 .unwrap_or(image_ops::TEXT_DET_IMAGES_PATH);
             let target_dir = prep_matches.value_of("target-dir").unwrap_or(".");
-        //     image_ops::generate_text_det_tensor_chunks(
-        //         image_ops::TEXT_DET_IMAGES_PATH,
-        //         true,
-        //         (800, 800),
-        //     )?;
-        //     image_ops::generate_text_det_tensor_chunks(
-        //         image_ops::TEXT_DET_IMAGES_PATH,
-        //         false,
-        //         (800, 800),
-        //     )?;
+            image_ops::generate_text_det_tensor_chunks(data_dir, target_dir, true, (800, 800))?;
+            image_ops::generate_text_det_tensor_chunks(data_dir, target_dir, false, (800, 800))?;
         } else {
             let image_path = scmd_matches.value_of("INPUT").unwrap();
             let model_file_path = scmd_matches
