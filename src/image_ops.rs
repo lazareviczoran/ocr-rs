@@ -1,10 +1,11 @@
 use super::dataset::TextDetectionDataset;
 use super::utils::{VALUES_COUNT, VALUES_MAP};
+use crate::utils::save_tensor;
 use anyhow::{anyhow, Result};
 use image::{imageops::FilterType, open, DynamicImage, GrayImage, ImageBuffer, Luma};
-use imageproc::definitions::Point;
+use imageproc::definitions::{HasBlack, HasWhite, Point};
 use imageproc::drawing::draw_polygon_mut;
-use log::{error, trace};
+use log::{error, info, trace};
 use rayon::prelude::*;
 use regex::Regex;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
@@ -17,12 +18,12 @@ use std::time::Instant;
 use tch::vision::dataset::Dataset;
 use tch::{Kind, Tensor};
 
-const CHAR_REC_IMAGES_PATH: &str = "images";
-const CHAR_REC_TRAIN_IMAGES_FILE: &str = "training_images_data_char";
-const CHAR_REC_TRAIN_LABELS_FILE: &str = "training_labels_data_char";
-const CHAR_REC_TEST_IMAGES_FILE: &str = "test_images_data_char";
-const CHAR_REC_TEST_LABELS_FILE: &str = "test_labels_data_char";
-pub const TEXT_DET_IMAGES_PATH: &str = "text-detection-images/totaltext";
+pub const CHAR_REC_IMAGES_PATH: &str = "./images";
+const CHAR_REC_TRAIN_IMAGES_FILE: &str = "training_images_data_char_rec";
+const CHAR_REC_TRAIN_LABELS_FILE: &str = "training_labels_data_char_rec";
+const CHAR_REC_TEST_IMAGES_FILE: &str = "test_images_data_char_rec";
+const CHAR_REC_TEST_LABELS_FILE: &str = "test_labels_data_char_rec";
+pub const TEXT_DET_IMAGES_PATH: &str = "./text-detection-images";
 pub const TEXT_DET_TRAIN_IMAGES_FILE: &str = "training_images_data_text_det";
 pub const TEXT_DET_TRAIN_GT_FILE: &str = "training_gt_data_text_det";
 pub const TEXT_DET_TRAIN_MASK_FILE: &str = "training_mask_data_text_det";
@@ -35,11 +36,7 @@ pub const TEXT_DET_TEST_MASK_FILE: &str = "test_mask_data_text_det";
 pub const TEXT_DET_TEST_ADJ_FILE: &str = "test_adj_data_text_det";
 pub const TEXT_DET_TEST_POLYS_FILE: &str = "test_polys_data_text_det";
 pub const TEXT_DET_TEST_IGNORE_FLAGS_FILE: &str = "test_ignore_flags_data_text_det";
-const DEFAULT_WIDTH: u32 = 800;
-const DEFAULT_HEIGHT: u32 = 800;
-const WHITE_COLOR: Luma<u8> = Luma([255]);
-const BLACK_COLOR: Luma<u8> = Luma([0]);
-const MIN_TEXT_SIZE: u32 = 8;
+pub const MIN_TEXT_SIZE: u32 = 8;
 
 lazy_static! {
     static ref CHAR_REC_FILE_NAME_FORMAT_REGEX: Regex =
@@ -47,13 +44,13 @@ lazy_static! {
     static ref TEXT_DET_FILE_NAME_FORMAT_REGEX: Regex = Regex::new(r"img[0-9]+\.jpg").unwrap();
 }
 
-pub fn load_values() -> Result<Dataset> {
+pub fn load_values(target_dir: &str) -> Result<Dataset> {
     trace!("loading character recognition values");
     let instant = Instant::now();
-    let train_images = load_values_from_file(CHAR_REC_TRAIN_IMAGES_FILE)?;
-    let train_labels = load_values_from_file(CHAR_REC_TRAIN_LABELS_FILE)?;
-    let test_images = load_values_from_file(CHAR_REC_TEST_IMAGES_FILE)?;
-    let test_labels = load_values_from_file(CHAR_REC_TEST_LABELS_FILE)?;
+    let train_images = Tensor::load(&format!("{}/{}", target_dir, CHAR_REC_TRAIN_IMAGES_FILE))?;
+    let train_labels = Tensor::load(&format!("{}/{}", target_dir, CHAR_REC_TRAIN_LABELS_FILE))?;
+    let test_images = Tensor::load(&format!("{}/{}", target_dir, CHAR_REC_TEST_IMAGES_FILE))?;
+    let test_labels = Tensor::load(&format!("{}/{}", target_dir, CHAR_REC_TEST_LABELS_FILE))?;
     trace!(
         "Finished loading values in {} ms",
         instant.elapsed().as_millis()
@@ -74,41 +71,37 @@ pub fn load_image_as_tensor(file_path: &str) -> Result<Tensor> {
     }
     let image = open(file_path)?.into_luma();
     let dim = image.width() * image.height();
-    let images_tensor = convert_image_to_tensor(&image)?.view((1, dim as i64)) / 255.;
+    let images_tensor = convert_image_to_tensor(&image)?
+        .view((1, dim as i64))
+        .to_kind(Kind::Float)
+        / 255.;
     Ok(images_tensor)
 }
 
-fn load_values_from_file(file_path: &str) -> Result<Tensor> {
-    let data_tensor;
-    if Path::new(file_path).exists() {
-        data_tensor = Tensor::load(file_path)?;
-    } else {
-        let images_path;
-        let labels_path;
-        let images_dir;
-        let is_images =
-            file_path == CHAR_REC_TEST_IMAGES_FILE || file_path == CHAR_REC_TRAIN_IMAGES_FILE;
-        if file_path == CHAR_REC_TEST_IMAGES_FILE || file_path == CHAR_REC_TEST_LABELS_FILE {
-            images_path = CHAR_REC_TEST_IMAGES_FILE;
-            labels_path = CHAR_REC_TEST_LABELS_FILE;
-            images_dir = format!("{}/test", CHAR_REC_IMAGES_PATH);
-        } else {
-            images_path = CHAR_REC_TRAIN_IMAGES_FILE;
-            labels_path = CHAR_REC_TRAIN_LABELS_FILE;
-            images_dir = format!("{}/training", CHAR_REC_IMAGES_PATH);
-        }
-        if is_images {
-            let images_data = load_images(&images_dir)?;
-            images_data.save(images_path)?;
-            data_tensor = images_data;
-        } else {
-            let labels_data = load_labels(&images_dir)?;
-            labels_data.save(labels_path)?;
-            data_tensor = labels_data;
-        }
-    }
+pub fn generate_char_rec_tensor_files(images_dir: &str, target_dir: &str) -> Result<()> {
+    let training_images_data = load_images(&format!("{}/train", images_dir))?;
+    save_tensor(
+        &training_images_data,
+        &format!("{}/{}", target_dir, CHAR_REC_TRAIN_IMAGES_FILE),
+    )?;
+    let training_labels_data = load_labels(&format!("{}/train", images_dir))?;
+    save_tensor(
+        &training_labels_data,
+        &format!("{}/{}", target_dir, CHAR_REC_TRAIN_LABELS_FILE),
+    )?;
+    let test_images_data = load_images(&format!("{}/test", images_dir))?;
+    save_tensor(
+        &test_images_data,
+        &format!("{}/{}", target_dir, CHAR_REC_TEST_IMAGES_FILE),
+    )?;
+    let test_labels_data = load_labels(&format!("{}/test", images_dir))?;
+    save_tensor(
+        &test_labels_data,
+        &format!("{}/{}", target_dir, CHAR_REC_TEST_LABELS_FILE),
+    )?;
+    info!("Successfully generated tensor files!");
 
-    Ok(data_tensor)
+    Ok(())
 }
 
 fn load_images(dir_path: &str) -> Result<Tensor> {
@@ -117,7 +110,7 @@ fn load_images(dir_path: &str) -> Result<Tensor> {
         let (images_tensor, rows, cols) = files_info
             .par_iter()
             .fold(
-                || (Tensor::new(), 0, 0),
+                || (Tensor::of_slice(&[0]), 0, 0),
                 |(mut p_vec, mut rows, mut cols), file| {
                     let filename = file.file_name();
                     if CHAR_REC_FILE_NAME_FORMAT_REGEX
@@ -132,23 +125,33 @@ fn load_images(dir_path: &str) -> Result<Tensor> {
                             .unwrap()
                             .view((1, (image.width() * image.height()) as i64));
                         cols = image_tensor.size()[1];
-                        p_vec = Tensor::cat(&[p_vec, image_tensor], 0);
+
+                        p_vec = if p_vec.numel() == 1 {
+                            image_tensor
+                        } else {
+                            Tensor::cat(&[p_vec, image_tensor], 0)
+                        };
                     }
                     (p_vec, rows, cols)
                 },
             )
             .reduce(
-                || (Tensor::new(), 0, 0),
+                || (Tensor::of_slice(&[0]), 0, 0),
                 |(acc_vec, total_rows, _), (partial, p_rows, p_cols)| {
-                    (
-                        Tensor::cat(&[acc_vec, partial], 0),
-                        total_rows + p_rows,
-                        p_cols,
-                    )
+                    let new_rows = total_rows + p_rows;
+                    let new_acc = if acc_vec.numel() == 1 {
+                        partial
+                    } else {
+                        Tensor::cat(&[acc_vec, partial], 0)
+                    };
+                    (new_acc, new_rows, p_cols)
                 },
             );
         trace!("Creating tensor for images r-{} c-{}", rows, cols);
-        return Ok(images_tensor.view((rows as i64, cols as i64)) / 255.);
+        return Ok(images_tensor
+            .view((rows as i64, cols as i64))
+            .to_kind(Kind::Float)
+            / 255.);
     }
     Err(anyhow!("Could not open dir {}", dir_path))
 }
@@ -264,10 +267,10 @@ fn generate_gt_and_mask_images(
             continue;
         }
         if poly_height.min(poly_width) < MIN_TEXT_SIZE {
-            draw_polygon_mut(&mut mask_image, &poly_values, BLACK_COLOR);
+            draw_polygon_mut(&mut mask_image, &poly_values, Luma::black());
             ignore_flags[pos] = true;
         } else {
-            draw_polygon_mut(&mut gt_image, &poly_values, WHITE_COLOR);
+            draw_polygon_mut(&mut gt_image, &poly_values, Luma::white());
         }
     }
     Ok((gt_image, mask_image, ignore_flags))
@@ -508,11 +511,11 @@ pub struct BatchPolygons(pub Vec<MultiplePolygons>);
 
 pub fn generate_text_det_tensor_chunks(
     images_base_dir: &str,
+    target_dir: &str,
     train: bool,
-    target_dim: Option<(u32, u32)>,
+    dim: (u32, u32),
 ) -> Result<()> {
     let instant = Instant::now();
-    let dim = target_dim.unwrap_or((DEFAULT_WIDTH, DEFAULT_HEIGHT));
     let images_file;
     let gt_file;
     let mask_file;
@@ -520,7 +523,7 @@ pub fn generate_text_det_tensor_chunks(
     let polys_file;
     let ignore_flags_file;
     let window_size;
-    let target_dir;
+    let images_dir;
     if train {
         images_file = get_target_filename(TEXT_DET_TRAIN_IMAGES_FILE);
         gt_file = get_target_filename(TEXT_DET_TRAIN_GT_FILE);
@@ -529,7 +532,7 @@ pub fn generate_text_det_tensor_chunks(
         polys_file = get_target_filename(TEXT_DET_TRAIN_POLYS_FILE);
         ignore_flags_file = get_target_filename(TEXT_DET_TRAIN_IGNORE_FLAGS_FILE);
         window_size = 40;
-        target_dir = "train";
+        images_dir = format!("{}/images/{}", images_base_dir, "train");
     } else {
         images_file = get_target_filename(TEXT_DET_TEST_IMAGES_FILE);
         gt_file = get_target_filename(TEXT_DET_TEST_GT_FILE);
@@ -538,10 +541,9 @@ pub fn generate_text_det_tensor_chunks(
         polys_file = get_target_filename(TEXT_DET_TEST_POLYS_FILE);
         ignore_flags_file = get_target_filename(TEXT_DET_TEST_IGNORE_FLAGS_FILE);
         window_size = 10;
-        target_dir = "test";
+        images_dir = format!("{}/images/{}", images_base_dir, "test");
     };
 
-    let images_dir = format!("{}/images/{}", images_base_dir, target_dir);
     if let Ok(files) = fs::read_dir(&images_dir) {
         let filenames: Vec<String> = files
             .map(|f| f.unwrap().path().display().to_string())
@@ -666,33 +668,37 @@ pub fn generate_text_det_tensor_chunks(
                             )
                         },
                     );
-                let mut save_res = images
-                    .view((-1, dim.0 as i64, dim.1 as i64))
-                    .save(format!("{}.{}", images_file, pos));
+                let mut save_res = save_tensor(
+                    &images.view((-1, dim.0 as i64, dim.1 as i64)),
+                    &format!("{}/{}.{}", target_dir, images_file, pos),
+                );
                 if let Err(msg) = save_res {
                     error!("Error while saving image tensor {}", msg);
                 }
-                save_res = gts
-                    .view((-1, dim.0 as i64, dim.1 as i64))
-                    .save(format!("{}.{}", gt_file, pos));
+                save_res = save_tensor(
+                    &gts.view((-1, dim.0 as i64, dim.1 as i64)),
+                    &format!("{}/{}.{}", target_dir, gt_file, pos),
+                );
                 if let Err(msg) = save_res {
                     error!("Error while saving gt tensor {}", msg);
                 }
-                save_res = masks
-                    .view((-1, dim.0 as i64, dim.1 as i64))
-                    .save(format!("{}.{}", mask_file, pos));
+                save_res = save_tensor(
+                    &masks.view((-1, dim.0 as i64, dim.1 as i64)),
+                    &format!("{}/{}.{}", target_dir, mask_file, pos),
+                );
                 if let Err(msg) = save_res {
                     error!("Error while saving mask tensor {}", msg);
                 }
-                save_res = adjust_values
-                    .view((-1, 2))
-                    .save(format!("{}.{}", adj_file, pos));
+                save_res = save_tensor(
+                    &adjust_values.view((-1, 2)),
+                    &format!("{}/{}.{}", target_dir, adj_file, pos),
+                );
                 if let Err(msg) = save_res {
                     error!("Error while saving adj tensor {}", msg);
                 }
                 let save_res = save_batch_polygons(
                     &BatchPolygons(batch_polygons),
-                    &format!("{}.{}", polys_file, pos),
+                    &format!("{}/{}.{}", target_dir, polys_file, pos),
                     true,
                 );
                 if let Err(msg) = save_res {
@@ -700,7 +706,7 @@ pub fn generate_text_det_tensor_chunks(
                 }
                 let save_res = save_vec_to_file(
                     &batch_ignore_flags,
-                    &format!("{}.{}", ignore_flags_file, pos),
+                    &format!("{}/{}.{}", target_dir, ignore_flags_file, pos),
                     true,
                 );
                 if let Err(msg) = save_res {
@@ -710,6 +716,10 @@ pub fn generate_text_det_tensor_chunks(
         trace!(
             "finished generating tensors in {} ms",
             instant.elapsed().as_millis()
+        );
+        info!(
+            "Successfully generated {} tensor files!",
+            if train { "train" } else { "test" }
         );
         Ok(())
     } else {
@@ -840,8 +850,8 @@ mod tests {
     #[test]
     fn tensor_generating_tests() -> Result<()> {
         // generate tensors
-        generate_text_det_tensor_chunks("test_data/text_det", true, None)?;
-        generate_text_det_tensor_chunks("test_data/text_det", false, None)?;
+        generate_text_det_tensor_chunks("test_data/text_det", ".", true, (800, 800))?;
+        generate_text_det_tensor_chunks("test_data/text_det", ".", false, (800, 800))?;
 
         // load expected images
         let train_img1 = open("test_data/preprocessed_img55.png")?.to_luma();
