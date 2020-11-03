@@ -1,6 +1,7 @@
 use super::dataset::TextDetectionDataset;
 use super::image_ops::{self, BatchPolygons, MultiplePolygons};
 use super::DEVICE;
+use crate::utils::{parse_dimensions, parse_number, save_vs};
 use anyhow::{anyhow, Result};
 use geo::prelude::*;
 use geo::{LineString, Polygon};
@@ -98,22 +99,6 @@ impl<'a> TextDetOptions<'a> {
         }
 
         Ok(opts)
-    }
-}
-
-pub fn parse_number<T: std::str::FromStr>(num_str: &str, field: &str) -> Result<T> {
-    match num_str.parse::<T>() {
-        Ok(val) => Ok(val),
-        Err(_msg) => Err(anyhow!("Could not parse {} value: {}", field, num_str)),
-    }
-}
-
-pub fn parse_dimensions(dims_str: &str) -> Result<(u32, u32)> {
-    let values = dims_str.split_terminator('x').collect::<Vec<&str>>();
-    if values.len() == 2 {
-        Ok((values[0].parse()?, values[1].parse()?))
-    } else {
-        Err(anyhow!("Could not parse dimensions value: {}", dims_str))
     }
 }
 
@@ -369,7 +354,7 @@ pub fn train_model(opts: &TextDetOptions) -> Result<FuncT<'static>> {
                         train_pred_time, loss_time, backward_time
                     );
             }
-            vs.save(opts.model_file_path)?;
+            save_vs(&vs, opts.model_file_path)?;
         }
         debug!(
             "Finished training single batch in {} ms",

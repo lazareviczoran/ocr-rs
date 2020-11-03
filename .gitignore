@@ -7,10 +7,10 @@
 
 /images/*
 **/.DS_Store
-test_images_data
-test_labels_data
-training_images_data
-training_labels_data
+test_images_data_char_rec
+test_labels_data_char_rec
+training_images_data_char_rec
+training_labels_data_char_rec
 log/
 Cargo.lock
 **/*.model

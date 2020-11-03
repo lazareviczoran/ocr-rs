@@ -14,12 +14,11 @@ mod text_detection_model;
 mod utils;
 
 use anyhow::Result;
-use clap::{App, SubCommand};
+use clap::{App, AppSettings, SubCommand};
 use tch::Device;
 
-const CHAR_REC_SC: &str = "char-rec";
+const CHAR_REC_SC: &str = "char-recognition";
 const TEXT_DETECTION_SC: &str = "text-detection";
-const IMAGE_OPS_SC: &str = "image-ops";
 
 lazy_static! {
     pub static ref DEVICE: Device = Device::cuda_if_available();
@@ -31,26 +30,48 @@ fn main() -> Result<()> {
     let matches = App::new("CLI for ocr-rs")
         .version("0.0.1")
         .author("Zoran Lazarevic <lazarevic.zoki91@gmail.com>")
-        .about("A CLI tool for training/evaluating models for character recognition/text detection/both")
+        .about("A CLI tool for training/evaluating models for character recognition/text detection/OCR")
         .subcommand(
-            SubCommand::with_name("char-rec")
+            SubCommand::with_name(CHAR_REC_SC)
+                .alias("cr")
                 .about("Controls for the character recognition model")
-        )
-        .subcommand(
-            SubCommand::with_name("text-detection")
-                .about("Controls for the text detection model")
-                .subcommand(
-                    SubCommand::with_name("run").about("Runs the text detection on the provided image")
-                        .args_from_usage("
-                        <INPUT>                 'Path to the file to run the detection on'
-                        --model-file [FILE]     'Path to the model file'
-                        –-dimensions [DIM]      'The target dimensions of preprocessed image (e.g. 800x800)'
-                    ")
+                .setting(AppSettings::SubcommandsNegateReqs)
+                .args_from_usage(
+                    "<INPUT>                'Path to the file to run the detection on'
+                    --model-file [FILE]     'Path to the model file'"
                 )
                 .subcommand(
                     SubCommand::with_name("train").about("Trains the model")
-                        .args_from_usage("
-                            --model-file [FILE]         'Path to the model file'
+                        .args_from_usage(
+                            "--model-file [FILE]        'Path to the model file'
+                            --tensor-files-dir [DIR]    'Path to the tensor files directory'
+                            --resume                    'Continue the training process on an existing model'
+                            --epoch [EPOCH]             'Specify the number of training iterations'
+                            --learning-rate [LR]        'Specify the learning rate'"
+                        )
+                )
+                .subcommand(
+                    SubCommand::with_name("prepare-tensors").about("Converts images/labels into tensors and stores them on the file system")
+                        .args_from_usage(
+                            "--target-dir [DIR]         'Path to the directory where the files will be stored (default: .)'
+                            --data-dir [DATA_DIR]       'Path to the directory containing the images need to be loaded (default: ./images)'"
+                        )
+                )
+        )
+        .subcommand(
+            SubCommand::with_name(TEXT_DETECTION_SC)
+                .alias("td")
+                .about("Controls for the text detection model training/inference")
+                .setting(AppSettings::SubcommandsNegateReqs)
+                .args_from_usage(
+                    "<INPUT>                'Path to the file to run the detection on'
+                    --model-file [FILE]     'Path to the model file'
+                    -d, --dimensions [DIM]  'The target dimensions of preprocessed image (e.g. 800x800)'"
+                )
+                .subcommand(
+                    SubCommand::with_name("train").about("Trains the model")
+                        .args_from_usage(
+                            "--model-file [FILE]        'Path to the model file'
                             --tensor-files-dir [DIR]    'Path to the tensor files directory'
                             --resume                    'Continue the training process on an existing model'
                             --epoch [EPOCH]             'Specify the number of training iterations'
@@ -59,53 +80,73 @@ fn main() -> Result<()> {
                             --dampening [D]             'Specify the SGD dampening'
                             --weight-decay [WD]         'Specify the SGD weight decay'
                             --no-nesterov               'Do not use Nesterov momentum'
-                            --dimensions [DIM]          'The target dimensions of preprocessed image (e.g. 800x800)'
-                            --test-interval [INT]       'Specify the the number of iterations after which the accuracy test will run'
-                        ")
-                ),
-        )
-        .subcommand(
-            SubCommand::with_name("image-ops")
-                .about("Offers some useful image operations")
+                            -d, --dimensions [DIM]      'The target dimensions of preprocessed image (e.g. 800x800)'
+                            --test-interval [INT]       'Specify the the number of iterations after which the accuracy test will run'"
+                        )
+                )
+                .subcommand(
+                    SubCommand::with_name("prepare-tensors").about("Converts images/gts into tensors and stores them on the file system")
+                        .args_from_usage(
+                            "--target-dir [DIR]         'Path to the directory where the files will be stored (default: .)'
+                            --data-dir [DATA_DIR]       'Path to the directory containing the images need to be loaded (default: ./text-detection-images)'
+                            -d, --dimensions [DIM]      'The target dimensions of preprocessed image (e.g. 800x800)'"
+                        )
+                )
         )
         .get_matches();
 
     if let Some(scmd_matches) = matches.subcommand_matches(CHAR_REC_SC) {
         // handling character recognition match
-        let image_tensor =
-            image_ops::load_image_as_tensor("images/test/akronim-dist-1-regular-upper-M-img.png")?;
-        char_recognition::run_prediction(&image_tensor)?;
+        if let Some(train_mathes) = scmd_matches.subcommand_matches("train") {
+            let options = char_recognition::CharRecOptions::new(train_mathes)?;
+            char_recognition::train_model(&options)?;
+        } else if let Some(prep_matches) = scmd_matches.subcommand_matches("prepare-tensors") {
+            let data_dir = prep_matches
+                .value_of("data-dir")
+                .unwrap_or(image_ops::CHAR_REC_IMAGES_PATH);
+            let target_dir = prep_matches.value_of("target-dir").unwrap_or(".");
+            image_ops::generate_char_rec_tensor_files(data_dir, target_dir)?;
+        } else {
+            let image_path = scmd_matches.value_of("INPUT").unwrap();
+            let model_file_path = scmd_matches
+                .value_of("model-file")
+                .unwrap_or(char_recognition::MODEL_FILENAME);
+            char_recognition::run_prediction(image_path, model_file_path)?;
+        }
     } else if let Some(scmd_matches) = matches.subcommand_matches(TEXT_DETECTION_SC) {
         // handling text detection match
         if let Some(train_mathes) = scmd_matches.subcommand_matches("train") {
             let options = text_detection_model::TextDetOptions::new(train_mathes)?;
             text_detection_model::train_model(&options)?;
-        } else if let Some(run_matches) = scmd_matches.subcommand_matches("run") {
-            let image_path = run_matches.value_of("INPUT").unwrap();
-            let model_file_path = run_matches
+        } else if let Some(prep_matches) = scmd_matches.subcommand_matches("prepare-tensors") {
+            let data_dir = prep_matches
+                .value_of("data-dir")
+                .unwrap_or(image_ops::TEXT_DET_IMAGES_PATH);
+            let target_dir = prep_matches.value_of("target-dir").unwrap_or(".");
+        //     image_ops::generate_text_det_tensor_chunks(
+        //         image_ops::TEXT_DET_IMAGES_PATH,
+        //         true,
+        //         (800, 800),
+        //     )?;
+        //     image_ops::generate_text_det_tensor_chunks(
+        //         image_ops::TEXT_DET_IMAGES_PATH,
+        //         false,
+        //         (800, 800),
+        //     )?;
+        } else {
+            let image_path = scmd_matches.value_of("INPUT").unwrap();
+            let model_file_path = scmd_matches
                 .value_of("model-file")
                 .unwrap_or(text_detection_model::MODEL_FILENAME);
             let mut dimensions = (
                 text_detection_model::DEFAULT_WIDTH,
                 text_detection_model::DEFAULT_HEIGHT,
             );
-            if let Some(dims_str) = run_matches.value_of("dimensions") {
-                dimensions = text_detection_model::parse_dimensions(dims_str)?;
+            if let Some(dims_str) = scmd_matches.value_of("dimensions") {
+                dimensions = utils::parse_dimensions(dims_str)?;
             }
             text_detection_model::run_text_detection(image_path, model_file_path, dimensions)?;
         }
-    } else if let Some(_matches) = matches.subcommand_matches(IMAGE_OPS_SC) {
-        // image_ops::load_text_detection_images()?;
-        image_ops::generate_text_det_tensor_chunks(
-            image_ops::TEXT_DET_IMAGES_PATH,
-            true,
-            (800, 800),
-        )?;
-        image_ops::generate_text_det_tensor_chunks(
-            image_ops::TEXT_DET_IMAGES_PATH,
-            false,
-            (800, 800),
-        )?;
     }
 
     Ok(())

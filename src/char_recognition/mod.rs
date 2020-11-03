@@ -1,13 +1,13 @@
 use super::image_ops;
-use super::utils;
+use super::utils::{parse_number, save_vs, topk, VALUES_COUNT_I64};
 use super::DEVICE;
-use anyhow::Result;
+use anyhow::{anyhow, Result};
 use log::{debug, info};
 use std::path::Path;
 use std::time::Instant;
 use tch::{nn, nn::ModuleT, nn::OptimizerConfig, Kind, Tensor};
 
-const MODEL_FILENAME: &str = "char_rec_conv_net.model";
+pub const MODEL_FILENAME: &str = "char_rec_conv_net.model";
 
 #[derive(Debug)]
 pub struct Net {
@@ -22,7 +22,7 @@ impl Net {
         let conv1 = nn::conv2d(vs, 1, 32, 5, Default::default());
         let conv2 = nn::conv2d(vs, 32, 64, 5, Default::default());
         let fc1 = nn::linear(vs, 1024, 512, Default::default());
-        let fc2 = nn::linear(vs, 512, utils::VALUES_COUNT_I64, Default::default());
+        let fc2 = nn::linear(vs, 512, VALUES_COUNT_I64, Default::default());
         Net {
             conv1,
             conv2,
@@ -47,12 +47,55 @@ impl nn::ModuleT for Net {
     }
 }
 
-pub fn create_and_train_model() -> Result<Net> {
-    let m = image_ops::load_values()?;
+#[derive(Debug)]
+pub struct CharRecOptions<'a> {
+    epoch: usize,
+    model_file_path: &'a str,
+    tensor_files_dir: &'a str,
+    learning_rate: f64,
+    resume: bool,
+}
+
+impl Default for CharRecOptions<'_> {
+    fn default() -> Self {
+        Self {
+            epoch: 100,
+            model_file_path: MODEL_FILENAME,
+            tensor_files_dir: ".",
+            learning_rate: 1e-4,
+            resume: false,
+        }
+    }
+}
+impl<'a> CharRecOptions<'a> {
+    pub fn new(args: &'a clap::ArgMatches) -> Result<Self> {
+        let mut opts = Self::default();
+        if let Some(epoch_str) = args.value_of("epoch") {
+            opts.epoch = parse_number(epoch_str, "epoch")?;
+        }
+        if let Some(path) = args.value_of("model-file") {
+            opts.model_file_path = path;
+        }
+        if let Some(path) = args.value_of("tensor-files-dir") {
+            opts.tensor_files_dir = path;
+        }
+        if let Some(lr_str) = args.value_of("learning-rate") {
+            opts.learning_rate = parse_number(lr_str, "learning rate")?;
+        }
+        if args.is_present("resume") {
+            opts.resume = true;
+        }
+
+        Ok(opts)
+    }
+}
+
+pub fn train_model(opts: &CharRecOptions) -> Result<Net> {
+    let m = image_ops::load_values(opts.tensor_files_dir)?;
     let vs = nn::VarStore::new(*DEVICE);
     let net = Net::new(&vs.root());
-    let mut opt = nn::Adam::default().build(&vs, 1e-4)?;
-    for epoch in 1..=100 {
+    let mut opt = nn::Adam::default().build(&vs, opts.learning_rate)?;
+    for epoch in 1..=opts.epoch {
         for (bimages, blabels) in m.train_iter(256).shuffle().to_device(vs.device()) {
             let loss = net
                 .forward_t(&bimages, true)
@@ -64,29 +107,26 @@ pub fn create_and_train_model() -> Result<Net> {
         info!("epoch: {:4} test acc: {:5.2}%", epoch, 100. * test_accuracy,);
     }
 
-    vs.save(MODEL_FILENAME)?;
+    save_vs(&vs, opts.model_file_path)?;
 
     Ok(net)
 }
 
-pub fn run_prediction(image_tensor: &Tensor) -> Result<()> {
-    let net: Net;
-    if !Path::new(MODEL_FILENAME).exists() {
-        info!("Started new training process");
-        net = create_and_train_model()?;
-        info!("Completed the training process")
-    } else {
-        let mut weights = nn::VarStore::new(*DEVICE);
-        net = Net::new(&weights.root());
-        weights.load(MODEL_FILENAME)?;
+pub fn run_prediction(image_path: &str, model_file_path: &str) -> Result<()> {
+    if !Path::new(model_file_path).exists() {
+        return Err(anyhow!("Model file {} doesn't exist", model_file_path));
     }
+    let mut weights = nn::VarStore::new(*DEVICE);
+    let net = Net::new(&weights.root());
+    weights.load(model_file_path)?;
 
+    let image_tensor = image_ops::load_image_as_tensor(image_path)?;
     // recognize character
     let instant = Instant::now();
     let res = net
         .forward_t(&image_tensor, false)
         .softmax(-1, Kind::Double);
-    let (predicted_value, probability) = utils::topk(&res, 1)[0];
+    let (predicted_value, probability) = topk(&res, 1)[0];
 
     debug!(
         "finished classification in {:?} ns, with {} as result with {:3.2}% of certainty",
