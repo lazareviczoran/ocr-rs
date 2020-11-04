@@ -17,6 +17,7 @@ Cargo.lock
 text-detection-images/
 text_det_tensor_files/
 text_detection_results/
+deny.toml
 
 # profiling output
 perf.data
