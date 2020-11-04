@@ -47,7 +47,7 @@ pub fn run_text_detection(
     debug!("inference in {} ms", instant.elapsed().as_millis());
 
     instant = Instant::now();
-    let pred_image = image_ops::convert_tensor_to_image(&pred.get(0).get(0))?;
+    let pred_image = image_ops::convert_tensor_to_image(&(pred.get(0).get(0) * 255.))?;
     debug!("tensor -> image in {} ms", instant.elapsed().as_millis());
     instant = Instant::now();
     pred_image.save("pred.png")?;
