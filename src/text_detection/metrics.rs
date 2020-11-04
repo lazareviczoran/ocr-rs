@@ -138,7 +138,7 @@ pub fn get_boxes_from_bitmap(
     let mut scores = vec![0.; num_contours];
 
     for i in 0..num_contours {
-        let (points, sside) = get_mini_area_bounding_box(&contours[i]);
+        let (points, sside) = get_min_area_bounding_box(&contours[i]);
         if sside < min_size {
             continue;
         }
@@ -160,7 +160,7 @@ pub fn get_boxes_from_bitmap(
     Ok((MultiplePolygons(boxes), scores))
 }
 
-pub fn get_mini_area_bounding_box(contour: &[Point<u32>]) -> (Vec<Point<u32>>, f64) {
+pub fn get_min_area_bounding_box(contour: &[Point<u32>]) -> (Vec<Point<u32>>, f64) {
     let mut b_box = min_area_rect(contour);
     b_box.sort_by(|a, b| a.x.cmp(&b.x));
     let i1 = if b_box[1].y > b_box[0].y { 0 } else { 1 };
@@ -260,20 +260,17 @@ pub fn combine_results(results: &[MetricsItem]) -> Result<(f64, f64, f64)> {
         num_global_care_det += res.det_care;
         matched_sum += res.det_matched;
     }
-    let method_recall = if num_global_care_gt == 0 {
-        0.
-    } else {
-        matched_sum as f64 / num_global_care_gt as f64
+    let mut method_recall = 0.;
+    if num_global_care_gt != 0 {
+        method_recall = matched_sum as f64 / num_global_care_gt as f64;
     };
-    let method_precision = if num_global_care_det == 0 {
-        0.
-    } else {
-        matched_sum as f64 / num_global_care_det as f64
+    let mut method_precision = 0.;
+    if num_global_care_det != 0 {
+        method_precision = matched_sum as f64 / num_global_care_det as f64;
     };
-    let method_hmean = if method_recall + method_precision == 0. {
-        0.
-    } else {
-        2. * (method_recall * method_precision) / (method_recall + method_precision)
+    let mut method_hmean = 0.;
+    if method_recall + method_precision != 0. {
+        method_hmean = 2. * (method_recall * method_precision) / (method_recall + method_precision);
     };
     Ok((method_precision, method_recall, method_hmean))
 }
@@ -425,8 +422,8 @@ mod tests {
     use imageproc::drawing::draw_polygon_mut;
 
     #[test]
-    fn get_mini_area_bounding_box_test() {
-        let res = get_mini_area_bounding_box(&[
+    fn get_min_area_bounding_box_test() {
+        let res = get_min_area_bounding_box(&[
             Point::new(141, 24),
             Point::new(61, 16),
             Point::new(57, 53),

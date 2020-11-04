@@ -107,51 +107,43 @@ pub fn generate_char_rec_tensor_files(images_dir: &str, target_dir: &str) -> Res
 fn load_images(dir_path: &str) -> Result<Tensor> {
     if let Ok(files) = fs::read_dir(dir_path) {
         let files_info: Vec<std::fs::DirEntry> = files.map(|f| f.unwrap()).collect();
-        let (images_tensor, rows, cols) = files_info
+        let images_tensor = files_info
             .par_iter()
             .fold(
-                || (Tensor::of_slice(&[0]), 0, 0),
-                |(mut p_vec, mut rows, mut cols), file| {
+                || Tensor::of_slice(&[0]),
+                |mut p_vec, file| {
                     let filename = file.file_name();
                     if CHAR_REC_FILE_NAME_FORMAT_REGEX
                         .captures(filename.to_str().unwrap())
                         .is_some()
                     {
-                        rows += 1;
-                        let image = open(&file.path().display().to_string())
-                            .unwrap()
-                            .into_luma();
-                        let image_tensor = convert_image_to_tensor(&image)
-                            .unwrap()
-                            .view((1, (image.width() * image.height()) as i64));
-                        cols = image_tensor.size()[1];
+                        if let Ok(image) = open(&file.path().display().to_string()) {
+                            let gray_img = image.into_luma();
+                            let image_tensor = convert_image_to_tensor(&gray_img)
+                                .unwrap()
+                                .view((1, (gray_img.width() * gray_img.height()) as i64));
 
-                        p_vec = if p_vec.numel() == 1 {
-                            image_tensor
-                        } else {
-                            Tensor::cat(&[p_vec, image_tensor], 0)
-                        };
+                            p_vec = if p_vec.numel() == 1 {
+                                image_tensor
+                            } else {
+                                Tensor::cat(&[p_vec, image_tensor], 0)
+                            };
+                        }
                     }
-                    (p_vec, rows, cols)
+                    p_vec
                 },
             )
             .reduce(
-                || (Tensor::of_slice(&[0]), 0, 0),
-                |(acc_vec, total_rows, _), (partial, p_rows, p_cols)| {
-                    let new_rows = total_rows + p_rows;
-                    let new_acc = if acc_vec.numel() == 1 {
+                || Tensor::of_slice(&[0]),
+                |acc_vec, partial| {
+                    if acc_vec.numel() == 1 {
                         partial
                     } else {
                         Tensor::cat(&[acc_vec, partial], 0)
-                    };
-                    (new_acc, new_rows, p_cols)
+                    }
                 },
             );
-        trace!("Creating tensor for images r-{} c-{}", rows, cols);
-        return Ok(images_tensor
-            .view((rows as i64, cols as i64))
-            .to_kind(Kind::Float)
-            / 255.);
+        return Ok(images_tensor.to_kind(Kind::Float) / 255.);
     }
     Err(anyhow!("Could not open dir {}", dir_path))
 }
@@ -161,34 +153,24 @@ fn load_labels(dir_path: &str) -> Result<Tensor> {
         let filenames: Vec<String> = files
             .map(|f| f.unwrap().file_name().into_string().unwrap())
             .collect();
-        let (labels, rows, _cols) = filenames
+        let labels = filenames
             .par_iter()
-            .fold(
-                || (Vec::new(), 0, 0),
-                |(mut p_vec, mut rows, _), filename| {
-                    if let Some(caps) = CHAR_REC_FILE_NAME_FORMAT_REGEX.captures(filename) {
-                        rows += 1;
-                        let _font = String::from(&caps[1]);
-                        let _letter_type = String::from(&caps[2]);
-                        if let Some(letter) = caps[3].chars().next() {
-                            p_vec.push(*VALUES_MAP.get(&letter).unwrap());
-                        }
+            .fold(Vec::new, |mut p_vec, filename| {
+                if let Some(caps) = CHAR_REC_FILE_NAME_FORMAT_REGEX.captures(filename) {
+                    if let Some(letter) = caps[3].chars().next() {
+                        p_vec.push(*VALUES_MAP.get(&letter).unwrap());
                     }
-                    (p_vec, rows, 1)
-                },
-            )
-            .reduce(
-                || (Vec::new(), 0, 0),
-                |(mut acc_vec, total_rows, _), (mut partial, p_rows, p_cols)| {
-                    acc_vec.append(&mut partial);
-                    (acc_vec, total_rows + p_rows, p_cols)
-                },
-            );
-        trace!("Creating tensor for labels r-{} c-1", rows);
-        let labels_tensor = Tensor::of_slice(&labels).to_kind(Kind::Int64);
-        return Ok(labels_tensor);
+                }
+                p_vec
+            })
+            .reduce(Vec::new, |mut acc_vec, mut partial| {
+                acc_vec.append(&mut partial);
+                acc_vec
+            });
+        Ok(Tensor::of_slice(&labels).to_kind(Kind::Int64))
+    } else {
+        Err(anyhow!("Could not open dir {}", dir_path))
     }
-    Err(anyhow!("Could not open dir {}", dir_path))
 }
 
 pub fn preprocess_image(file_path: &str, target_dim: (u32, u32)) -> Result<(GrayImage, f64, f64)> {
@@ -236,9 +218,9 @@ fn generate_gt_and_mask_images(
     let (width, height) = target_dim;
     let mut gt_image = GrayImage::new(width, height);
     let mut mask_temp = DynamicImage::new_luma8(width, height);
-    let mut ignore_flags = vec![false; polygons.0.len()];
     mask_temp.invert();
     let mut mask_image = mask_temp.to_luma();
+    let mut ignore_flags = vec![false; polygons.0.len()];
     for (pos, poly) in polygons.0.iter().enumerate() {
         let num_of_points = poly.points.len();
         let (min_x, max_x, min_y, max_y) =
@@ -291,7 +273,6 @@ fn load_polygons(file_path: &str) -> Result<MultiplePolygons> {
                 // where n is number of points in the polygon (not a fixed value)
 
                 let raw_values = row.split_terminator(',').collect::<Vec<&str>>();
-
                 let values = raw_values[0..raw_values.len() - 1]
                     .iter()
                     .flat_map(|v| v.parse())
@@ -509,40 +490,40 @@ pub struct MultiplePolygons(pub Vec<Polygon>);
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
 pub struct BatchPolygons(pub Vec<MultiplePolygons>);
 
+#[derive(Debug)]
+pub struct TextDetDataBatch {
+    images_tensor: Tensor,
+    gts_tensor: Tensor,
+    masks_tensor: Tensor,
+    adjs_tensor: Tensor,
+    polygons: Vec<MultiplePolygons>,
+    ignore_flags: Vec<Vec<bool>>,
+}
+impl TextDetDataBatch {
+    pub fn new() -> Self {
+        Self {
+            images_tensor: Tensor::of_slice(&[0]),
+            gts_tensor: Tensor::of_slice(&[0]),
+            masks_tensor: Tensor::of_slice(&[0]),
+            adjs_tensor: Tensor::of_slice(&[0]),
+            polygons: Vec::new(),
+            ignore_flags: Vec::new(),
+        }
+    }
+}
+
 pub fn generate_text_det_tensor_chunks(
     images_base_dir: &str,
     target_dir: &str,
     train: bool,
     dim: (u32, u32),
 ) -> Result<()> {
-    let instant = Instant::now();
-    let images_file;
-    let gt_file;
-    let mask_file;
-    let adj_file;
-    let polys_file;
-    let ignore_flags_file;
-    let window_size;
-    let images_dir;
-    if train {
-        images_file = get_target_filename(TEXT_DET_TRAIN_IMAGES_FILE);
-        gt_file = get_target_filename(TEXT_DET_TRAIN_GT_FILE);
-        mask_file = get_target_filename(TEXT_DET_TRAIN_MASK_FILE);
-        adj_file = get_target_filename(TEXT_DET_TRAIN_ADJ_FILE);
-        polys_file = get_target_filename(TEXT_DET_TRAIN_POLYS_FILE);
-        ignore_flags_file = get_target_filename(TEXT_DET_TRAIN_IGNORE_FLAGS_FILE);
-        window_size = 40;
-        images_dir = format!("{}/images/{}", images_base_dir, "train");
-    } else {
-        images_file = get_target_filename(TEXT_DET_TEST_IMAGES_FILE);
-        gt_file = get_target_filename(TEXT_DET_TEST_GT_FILE);
-        mask_file = get_target_filename(TEXT_DET_TEST_MASK_FILE);
-        adj_file = get_target_filename(TEXT_DET_TEST_ADJ_FILE);
-        polys_file = get_target_filename(TEXT_DET_TEST_POLYS_FILE);
-        ignore_flags_file = get_target_filename(TEXT_DET_TEST_IGNORE_FLAGS_FILE);
-        window_size = 10;
-        images_dir = format!("{}/images/{}", images_base_dir, "test");
-    };
+    let window_size = if train { 40 } else { 10 };
+    let images_dir = format!(
+        "{}/images/{}",
+        images_base_dir,
+        if train { "train" } else { "test" }
+    );
 
     if let Ok(files) = fs::read_dir(&images_dir) {
         let filenames: Vec<String> = files
@@ -553,170 +534,55 @@ pub fn generate_text_det_tensor_chunks(
             .chunks(window_size)
             .enumerate()
             .for_each(|(pos, chunk)| {
-                let (images, gts, masks, adjust_values, batch_polygons, batch_ignore_flags) = chunk
+                let batch_data = chunk
                     .par_iter()
-                    .fold(
-                        || {
-                            (
-                                Tensor::of_slice(&[0]),
-                                Tensor::of_slice(&[0]),
-                                Tensor::of_slice(&[0]),
-                                Tensor::of_slice(&[0]),
-                                Vec::new(),
-                                Vec::new(),
-                            )
-                        },
-                        |(
-                            mut im_acc,
-                            mut gt_acc,
-                            mut mask_acc,
-                            mut adjust_acc,
-                            mut polygons_acc,
-                            mut ignore_flags_acc,
-                        ),
-                         filename| {
-                            if TEXT_DET_FILE_NAME_FORMAT_REGEX.captures(filename).is_some() {
-                                match load_text_detection_image(filename, dim) {
-                                    Ok((im, gt, mask, adj_values, polygons, ignore_flags)) => {
-                                        polygons_acc.push(polygons);
-                                        ignore_flags_acc.push(ignore_flags);
-                                        if im_acc.numel() == 1 {
-                                            return (
-                                                im,
-                                                gt,
-                                                mask,
-                                                adj_values,
-                                                polygons_acc,
-                                                ignore_flags_acc,
-                                            );
-                                        }
-                                        im_acc = Tensor::cat(&[im_acc, im], 0);
-                                        gt_acc = Tensor::cat(&[gt_acc, gt], 0);
-                                        mask_acc = Tensor::cat(&[mask_acc, mask], 0);
-                                        adjust_acc = Tensor::cat(&[adjust_acc, adj_values], 0);
-                                    }
-                                    Err(msg) => {
-                                        error!("Error while loading single image data: {}", msg);
+                    .fold(TextDetDataBatch::new, |mut acc, filename| {
+                        if TEXT_DET_FILE_NAME_FORMAT_REGEX.captures(filename).is_some() {
+                            match load_text_detection_image(filename, dim) {
+                                Ok((im, gt, mask, adj_values, polygons, ignore_flags)) => {
+                                    acc.polygons.push(polygons);
+                                    acc.ignore_flags.push(ignore_flags);
+                                    if acc.images_tensor.numel() == 1 {
+                                        acc.images_tensor = im;
+                                        acc.gts_tensor = gt;
+                                        acc.masks_tensor = mask;
+                                        acc.adjs_tensor = adj_values;
+                                    } else {
+                                        acc.images_tensor =
+                                            Tensor::cat(&[acc.images_tensor, im], 0);
+                                        acc.gts_tensor = Tensor::cat(&[acc.gts_tensor, gt], 0);
+                                        acc.masks_tensor =
+                                            Tensor::cat(&[acc.masks_tensor, mask], 0);
+                                        acc.adjs_tensor =
+                                            Tensor::cat(&[acc.adjs_tensor, adj_values], 0);
                                     }
                                 }
+                                Err(msg) => {
+                                    error!("Error while loading single image data: {}", msg);
+                                }
                             }
-                            (
-                                im_acc,
-                                gt_acc,
-                                mask_acc,
-                                adjust_acc,
-                                polygons_acc,
-                                ignore_flags_acc,
-                            )
-                        },
-                    )
-                    .reduce(
-                        || {
-                            (
-                                Tensor::of_slice(&[0]),
-                                Tensor::of_slice(&[0]),
-                                Tensor::of_slice(&[0]),
-                                Tensor::of_slice(&[0]),
-                                Vec::new(),
-                                Vec::new(),
-                            )
-                        },
-                        |(
-                            im_acc,
-                            gt_acc,
-                            mask_acc,
-                            adj_acc,
-                            mut polys_acc,
-                            mut ignore_flags_acc,
-                        ),
-                         (
-                            part_im,
-                            part_gt,
-                            part_mask,
-                            part_adj,
-                            mut part_polys,
-                            mut part_ignore_flags,
-                        )| {
-                            polys_acc.append(&mut part_polys);
-                            ignore_flags_acc.append(&mut part_ignore_flags);
-                            if im_acc.numel() == 1 {
-                                return (
-                                    part_im,
-                                    part_gt,
-                                    part_mask,
-                                    part_adj,
-                                    polys_acc,
-                                    ignore_flags_acc,
-                                );
-                            } else if part_im.numel() == 1 {
-                                return (
-                                    im_acc,
-                                    gt_acc,
-                                    mask_acc,
-                                    adj_acc,
-                                    polys_acc,
-                                    ignore_flags_acc,
-                                );
-                            }
-                            (
-                                Tensor::cat(&[im_acc, part_im], 0),
-                                Tensor::cat(&[gt_acc, part_gt], 0),
-                                Tensor::cat(&[mask_acc, part_mask], 0),
-                                Tensor::cat(&[adj_acc, part_adj], 0),
-                                polys_acc,
-                                ignore_flags_acc,
-                            )
-                        },
-                    );
-                let mut save_res = save_tensor(
-                    &images.view((-1, dim.0 as i64, dim.1 as i64)),
-                    &format!("{}/{}.{}", target_dir, images_file, pos),
-                );
-                if let Err(msg) = save_res {
-                    error!("Error while saving image tensor {}", msg);
-                }
-                save_res = save_tensor(
-                    &gts.view((-1, dim.0 as i64, dim.1 as i64)),
-                    &format!("{}/{}.{}", target_dir, gt_file, pos),
-                );
-                if let Err(msg) = save_res {
-                    error!("Error while saving gt tensor {}", msg);
-                }
-                save_res = save_tensor(
-                    &masks.view((-1, dim.0 as i64, dim.1 as i64)),
-                    &format!("{}/{}.{}", target_dir, mask_file, pos),
-                );
-                if let Err(msg) = save_res {
-                    error!("Error while saving mask tensor {}", msg);
-                }
-                save_res = save_tensor(
-                    &adjust_values.view((-1, 2)),
-                    &format!("{}/{}.{}", target_dir, adj_file, pos),
-                );
-                if let Err(msg) = save_res {
-                    error!("Error while saving adj tensor {}", msg);
-                }
-                let save_res = save_batch_polygons(
-                    &BatchPolygons(batch_polygons),
-                    &format!("{}/{}.{}", target_dir, polys_file, pos),
-                    true,
-                );
-                if let Err(msg) = save_res {
-                    error!("Error while saving polygons vec {}", msg);
-                }
-                let save_res = save_vec_to_file(
-                    &batch_ignore_flags,
-                    &format!("{}/{}.{}", target_dir, ignore_flags_file, pos),
-                    true,
-                );
-                if let Err(msg) = save_res {
-                    error!("Error while saving ignore flags vec {}", msg);
-                }
+                        }
+                        acc
+                    })
+                    .reduce(TextDetDataBatch::new, |mut acc, mut partial| {
+                        acc.polygons.append(&mut partial.polygons);
+                        acc.ignore_flags.append(&mut partial.ignore_flags);
+                        if acc.images_tensor.numel() == 1 {
+                            return partial;
+                        } else if partial.images_tensor.numel() != 1 {
+                            acc.images_tensor =
+                                Tensor::cat(&[acc.images_tensor, partial.images_tensor], 0);
+                            acc.gts_tensor = Tensor::cat(&[acc.gts_tensor, partial.gts_tensor], 0);
+                            acc.masks_tensor =
+                                Tensor::cat(&[acc.masks_tensor, partial.masks_tensor], 0);
+                            acc.adjs_tensor =
+                                Tensor::cat(&[acc.adjs_tensor, partial.adjs_tensor], 0);
+                        }
+                        acc
+                    });
+
+                save_batch(batch_data, target_dir, pos, train);
             });
-        trace!(
-            "finished generating tensors in {} ms",
-            instant.elapsed().as_millis()
-        );
         info!(
             "Successfully generated {} tensor files!",
             if train { "train" } else { "test" }
@@ -740,6 +606,68 @@ fn get_target_filename(name: &str) -> String {
 #[cfg(not(test))]
 fn get_target_filename(name: &str) -> String {
     String::from(name)
+}
+
+pub fn save_batch(batch: TextDetDataBatch, target_dir: &str, idx: usize, is_train: bool) {
+    let images_file;
+    let gt_file;
+    let mask_file;
+    let adj_file;
+    let polys_file;
+    let ignore_flags_file;
+    if is_train {
+        images_file = get_target_filename(TEXT_DET_TRAIN_IMAGES_FILE);
+        gt_file = get_target_filename(TEXT_DET_TRAIN_GT_FILE);
+        mask_file = get_target_filename(TEXT_DET_TRAIN_MASK_FILE);
+        adj_file = get_target_filename(TEXT_DET_TRAIN_ADJ_FILE);
+        polys_file = get_target_filename(TEXT_DET_TRAIN_POLYS_FILE);
+        ignore_flags_file = get_target_filename(TEXT_DET_TRAIN_IGNORE_FLAGS_FILE);
+    } else {
+        images_file = get_target_filename(TEXT_DET_TEST_IMAGES_FILE);
+        gt_file = get_target_filename(TEXT_DET_TEST_GT_FILE);
+        mask_file = get_target_filename(TEXT_DET_TEST_MASK_FILE);
+        adj_file = get_target_filename(TEXT_DET_TEST_ADJ_FILE);
+        polys_file = get_target_filename(TEXT_DET_TEST_POLYS_FILE);
+        ignore_flags_file = get_target_filename(TEXT_DET_TEST_IGNORE_FLAGS_FILE);
+    };
+    if let Err(msg) = save_tensor(
+        &batch.images_tensor,
+        &format!("{}/{}.{}", target_dir, images_file, idx),
+    ) {
+        error!("Error while saving image tensor {}", msg);
+    }
+    if let Err(msg) = save_tensor(
+        &batch.gts_tensor,
+        &format!("{}/{}.{}", target_dir, gt_file, idx),
+    ) {
+        error!("Error while saving gt tensor {}", msg);
+    }
+    if let Err(msg) = save_tensor(
+        &batch.masks_tensor,
+        &format!("{}/{}.{}", target_dir, mask_file, idx),
+    ) {
+        error!("Error while saving mask tensor {}", msg);
+    }
+    if let Err(msg) = save_tensor(
+        &batch.adjs_tensor.view((-1, 2)),
+        &format!("{}/{}.{}", target_dir, adj_file, idx),
+    ) {
+        error!("Error while saving adj tensor {}", msg);
+    }
+    if let Err(msg) = save_batch_polygons(
+        &BatchPolygons(batch.polygons),
+        &format!("{}/{}.{}", target_dir, polys_file, idx),
+        true,
+    ) {
+        error!("Error while saving polygons vec {}", msg);
+    }
+    if let Err(msg) = save_vec_to_file(
+        &batch.ignore_flags,
+        &format!("{}/{}.{}", target_dir, ignore_flags_file, idx),
+        true,
+    ) {
+        error!("Error while saving ignore flags vec {}", msg);
+    }
 }
 
 fn save_vec_to_file<T: Serialize>(value: &[T], file_path: &str, overwrite: bool) -> Result<()> {
