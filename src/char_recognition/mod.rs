@@ -2,6 +2,7 @@ pub mod model;
 pub mod options;
 
 use super::image_ops;
+use super::measure_time;
 use super::utils::{save_vs, topk};
 use super::DEVICE;
 use anyhow::{anyhow, Result};
@@ -9,7 +10,6 @@ use log::{debug, info};
 use model::Net;
 use options::CharRecOptions;
 use std::path::Path;
-use std::time::Instant;
 use tch::{nn, nn::ModuleT, nn::OptimizerConfig, Kind};
 
 pub const MODEL_FILENAME: &str = "char_rec_conv_net.model";
@@ -46,15 +46,19 @@ pub fn run_prediction(image_path: &str, model_file_path: &str) -> Result<()> {
 
     let image_tensor = image_ops::load_image_as_tensor(image_path)?;
     // recognize character
-    let instant = Instant::now();
-    let res = net
-        .forward_t(&image_tensor, false)
-        .softmax(-1, Kind::Double);
-    let (predicted_value, probability) = topk(&res, 1)[0];
+    let (predicted_value, probability) = measure_time!(
+        "character classification",
+        || {
+            let res = net
+                .forward_t(&image_tensor, false)
+                .softmax(-1, Kind::Double);
+            topk(&res, 1)[0]
+        },
+        LogType::Debug
+    );
 
     debug!(
-        "finished classification in {:?} ns, with {} as result with {:3.2}% of certainty",
-        instant.elapsed().as_nanos(),
+        "The image is classified as {} with {:3.2}% of certainty",
         predicted_value,
         probability * 100.
     );

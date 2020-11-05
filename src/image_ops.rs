@@ -15,7 +15,6 @@ use std::fs::{self, File};
 use std::io::prelude::*;
 use std::io::BufReader;
 use std::path::Path;
-use std::time::Instant;
 use tch::vision::dataset::Dataset;
 use tch::{Kind, Tensor};
 
@@ -182,7 +181,6 @@ fn load_labels(dir_path: &str) -> Result<Tensor> {
 
 pub fn preprocess_image(file_path: &str, target_dim: (u32, u32)) -> Result<(GrayImage, f64, f64)> {
     let (width, height) = target_dim;
-    let instant = Instant::now();
     let rgba_image = open(file_path)?.into_rgba();
     let original_width = rgba_image.width();
     let original_height = rgba_image.height();
@@ -205,10 +203,6 @@ pub fn preprocess_image(file_path: &str, target_dim: (u32, u32)) -> Result<(Gray
                 *val = dyn_image.get_pixel(x, y).0[0];
             }
         });
-    trace!(
-        "finished preprocessing in {} ns",
-        instant.elapsed().as_nanos()
-    );
     Ok((
         ImageBuffer::from_vec(width, height, pixel_values).unwrap(),
         adjust_x,
@@ -303,7 +297,6 @@ pub fn load_text_detection_image(
     file_path: &str,
     target_dim: (u32, u32),
 ) -> Result<(Tensor, Tensor, Tensor, Tensor, MultiplePolygons, Vec<bool>)> {
-    let instant = Instant::now();
     let (preprocessed_image, adjust_x, adjust_y) = preprocess_image(file_path, target_dim)?;
 
     let path_parts = file_path.split_terminator('/').collect::<Vec<&str>>();
@@ -322,11 +315,6 @@ pub fn load_text_detection_image(
     let gt_tensor = (convert_image_to_tensor(&gt_image)? / 255.).to_kind(Kind::Uint8);
     let mask_tensor = (convert_image_to_tensor(&mask_image)? / 255.).to_kind(Kind::Uint8);
     let adjust_tensor = Tensor::of_slice(&[adjust_x, adjust_y]).view((1, 2));
-
-    trace!(
-        "finished loading and preparing text detection images in {:?} ns",
-        instant.elapsed().as_nanos()
-    );
 
     Ok((
         image_tensor.view((1, target_dim.1 as i64, target_dim.0 as i64)),

@@ -45,6 +45,16 @@ macro_rules! show_message {
 /// #}
 #[macro_export]
 macro_rules! measure_time {
+    ($msg: expr, $fn: expr) => {{
+        let instant = std::time::Instant::now();
+        let res = $fn();
+        debug!(
+            "Finished \"{}\" in {} ms",
+            $msg,
+            instant.elapsed().as_millis(),
+        );
+        res
+    }};
     ($msg: expr, $fn: expr, $logtype: expr) => {{
         let instant = std::time::Instant::now();
         let res = $fn();
