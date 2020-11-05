@@ -1,4 +1,5 @@
 use super::dataset::TextDetectionDataset;
+use super::measure_time;
 use super::utils::{VALUES_COUNT, VALUES_MAP};
 use crate::utils::save_tensor;
 use anyhow::{anyhow, Result};
@@ -19,10 +20,10 @@ use tch::vision::dataset::Dataset;
 use tch::{Kind, Tensor};
 
 pub const CHAR_REC_IMAGES_PATH: &str = "./images";
-const CHAR_REC_TRAIN_IMAGES_FILE: &str = "training_images_data_char_rec";
-const CHAR_REC_TRAIN_LABELS_FILE: &str = "training_labels_data_char_rec";
-const CHAR_REC_TEST_IMAGES_FILE: &str = "test_images_data_char_rec";
-const CHAR_REC_TEST_LABELS_FILE: &str = "test_labels_data_char_rec";
+pub const CHAR_REC_TRAIN_IMAGES_FILE: &str = "training_images_data_char_rec";
+pub const CHAR_REC_TRAIN_LABELS_FILE: &str = "training_labels_data_char_rec";
+pub const CHAR_REC_TEST_IMAGES_FILE: &str = "test_images_data_char_rec";
+pub const CHAR_REC_TEST_LABELS_FILE: &str = "test_labels_data_char_rec";
 pub const TEXT_DET_IMAGES_PATH: &str = "./text-detection-images";
 pub const TEXT_DET_TRAIN_IMAGES_FILE: &str = "training_images_data_text_det";
 pub const TEXT_DET_TRAIN_GT_FILE: &str = "training_gt_data_text_det";
@@ -46,15 +47,21 @@ lazy_static! {
 
 pub fn load_values(target_dir: &str) -> Result<Dataset> {
     trace!("loading character recognition values");
-    let instant = Instant::now();
-    let train_images = Tensor::load(&format!("{}/{}", target_dir, CHAR_REC_TRAIN_IMAGES_FILE))?;
-    let train_labels = Tensor::load(&format!("{}/{}", target_dir, CHAR_REC_TRAIN_LABELS_FILE))?;
-    let test_images = Tensor::load(&format!("{}/{}", target_dir, CHAR_REC_TEST_IMAGES_FILE))?;
-    let test_labels = Tensor::load(&format!("{}/{}", target_dir, CHAR_REC_TEST_LABELS_FILE))?;
-    trace!(
-        "Finished loading values in {} ms",
-        instant.elapsed().as_millis()
-    );
+    let (train_images, train_labels, test_images, test_labels) = measure_time!(
+        "loading values",
+        || -> Result<(Tensor, Tensor, Tensor, Tensor)> {
+            let train_images =
+                Tensor::load(&format!("{}/{}", target_dir, CHAR_REC_TRAIN_IMAGES_FILE))?;
+            let train_labels =
+                Tensor::load(&format!("{}/{}", target_dir, CHAR_REC_TRAIN_LABELS_FILE))?;
+            let test_images =
+                Tensor::load(&format!("{}/{}", target_dir, CHAR_REC_TEST_IMAGES_FILE))?;
+            let test_labels =
+                Tensor::load(&format!("{}/{}", target_dir, CHAR_REC_TEST_LABELS_FILE))?;
+            Ok((train_images, train_labels, test_images, test_labels))
+        },
+        LogType::Debug
+    )?;
 
     Ok(Dataset {
         train_images,

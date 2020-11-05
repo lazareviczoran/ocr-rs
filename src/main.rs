@@ -10,6 +10,8 @@ extern crate tch;
 mod char_recognition;
 mod dataset;
 mod image_ops;
+#[macro_use]
+mod macros;
 mod text_detection;
 mod utils;
 
