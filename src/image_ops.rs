@@ -329,10 +329,10 @@ pub fn load_text_detection_image(
     );
 
     Ok((
-        image_tensor,
-        gt_tensor,
-        mask_tensor,
-        adjust_tensor,
+        image_tensor.view((1, target_dim.1 as i64, target_dim.0 as i64)),
+        gt_tensor.view((1, target_dim.1 as i64, target_dim.0 as i64)),
+        mask_tensor.view((1, target_dim.1 as i64, target_dim.0 as i64)),
+        adjust_tensor.view((1, -1)),
         polygons,
         ignore_flags,
     ))
@@ -572,11 +572,11 @@ pub fn generate_text_det_tensor_chunks(
                         acc
                     })
                     .reduce(TextDetDataBatch::new, |mut acc, mut partial| {
-                        acc.polygons.append(&mut partial.polygons);
-                        acc.ignore_flags.append(&mut partial.ignore_flags);
                         if acc.images_tensor.numel() == 1 {
-                            return partial;
+                            acc = partial;
                         } else if partial.images_tensor.numel() != 1 {
+                            acc.polygons.append(&mut partial.polygons);
+                            acc.ignore_flags.append(&mut partial.ignore_flags);
                             acc.images_tensor =
                                 Tensor::cat(&[acc.images_tensor, partial.images_tensor], 0);
                             acc.gts_tensor = Tensor::cat(&[acc.gts_tensor, partial.gts_tensor], 0);
