@@ -112,7 +112,8 @@ pub fn generate_char_rec_tensor_files(images_dir: &str, target_dir: &str) -> Res
 
 fn load_images(dir_path: &str) -> Result<Tensor> {
     if let Ok(files) = fs::read_dir(dir_path) {
-        let files_info: Vec<std::fs::DirEntry> = files.map(|f| f.unwrap()).collect();
+        let mut files_info: Vec<std::fs::DirEntry> = files.map(|f| f.unwrap()).collect();
+        files_info.sort_by_key(|a| a.file_name());
         let images_tensor = files_info
             .par_iter()
             .fold(
@@ -156,9 +157,10 @@ fn load_images(dir_path: &str) -> Result<Tensor> {
 
 fn load_labels(dir_path: &str) -> Result<Tensor> {
     if let Ok(files) = fs::read_dir(dir_path) {
-        let filenames: Vec<String> = files
+        let mut filenames: Vec<String> = files
             .map(|f| f.unwrap().file_name().into_string().unwrap())
             .collect();
+        filenames.sort();
         let labels = filenames
             .par_iter()
             .fold(Vec::new, |mut p_vec, filename| {
@@ -294,6 +296,7 @@ fn load_polygons(file_path: &str) -> Result<MultiplePolygons> {
 }
 
 pub fn load_text_detection_image(
+    images_base_dir: &str,
     file_path: &str,
     target_dim: (u32, u32),
 ) -> Result<(Tensor, Tensor, Tensor, Tensor, MultiplePolygons, Vec<bool>)> {
@@ -303,7 +306,7 @@ pub fn load_text_detection_image(
     let last_idx = path_parts.len() - 1;
     let polygons = load_polygons(&format!(
         "{}/gts/{}/{}.txt",
-        TEXT_DET_IMAGES_PATH,
+        images_base_dir,
         path_parts[last_idx - 1],
         path_parts[last_idx]
     ))?;
@@ -320,7 +323,7 @@ pub fn load_text_detection_image(
         image_tensor.view((1, target_dim.1 as i64, target_dim.0 as i64)),
         gt_tensor.view((1, target_dim.1 as i64, target_dim.0 as i64)),
         mask_tensor.view((1, target_dim.1 as i64, target_dim.0 as i64)),
-        adjust_tensor.view((1, -1)),
+        adjust_tensor,
         polygons,
         ignore_flags,
     ))
@@ -374,8 +377,9 @@ pub fn load_text_detection_tensor_files(target_dir: &str) -> Result<TextDetectio
         let mut test_adj = BTreeSet::new();
         let mut test_polys = BTreeSet::new();
         let mut test_ignore_flags = BTreeSet::new();
-        files.for_each(|f| {
-            let file = f.unwrap();
+        let mut files_info: Vec<std::fs::DirEntry> = files.map(|f| f.unwrap()).collect();
+        files_info.sort_by_key(|a| a.file_name());
+        files_info.iter().for_each(|file| {
             let filename = file.file_name().into_string().unwrap();
             let path = file.path().display().to_string();
             if filename.starts_with(&get_target_filename(TEXT_DET_TRAIN_IMAGES_FILE)) {
@@ -521,19 +525,26 @@ pub fn generate_text_det_tensor_chunks(
     );
 
     if let Ok(files) = fs::read_dir(&images_dir) {
-        let filenames: Vec<String> = files
-            .map(|f| f.unwrap().path().display().to_string())
-            .collect();
+        let mut files_info: Vec<std::fs::DirEntry> = files.map(|f| f.unwrap()).collect();
+        files_info.sort_by_key(|a| a.file_name());
 
-        filenames
+        files_info
             .chunks(window_size)
             .enumerate()
             .for_each(|(pos, chunk)| {
                 let batch_data = chunk
                     .par_iter()
-                    .fold(TextDetDataBatch::new, |mut acc, filename| {
-                        if TEXT_DET_FILE_NAME_FORMAT_REGEX.captures(filename).is_some() {
-                            match load_text_detection_image(filename, dim) {
+                    .fold(TextDetDataBatch::new, |mut acc, file| {
+                        let filename = file.file_name().into_string().unwrap();
+                        if TEXT_DET_FILE_NAME_FORMAT_REGEX
+                            .captures(&filename)
+                            .is_some()
+                        {
+                            match load_text_detection_image(
+                                images_base_dir,
+                                &file.path().display().to_string(),
+                                dim,
+                            ) {
                                 Ok((im, gt, mask, adj_values, polygons, ignore_flags)) => {
                                     acc.polygons.push(polygons);
                                     acc.ignore_flags.push(ignore_flags);
@@ -644,7 +655,7 @@ pub fn save_batch(batch: TextDetDataBatch, target_dir: &str, idx: usize, is_trai
         error!("Error while saving mask tensor {}", msg);
     }
     if let Err(msg) = save_tensor(
-        &batch.adjs_tensor.view((-1, 2)),
+        &batch.adjs_tensor,
         &format!("{}/{}.{}", target_dir, adj_file, idx),
     ) {
         error!("Error while saving adj tensor {}", msg);
@@ -777,12 +788,12 @@ mod tests {
         generate_text_det_tensor_chunks("test_data/text_det", ".", false, (800, 800))?;
 
         // load expected images
-        let train_img1 = open("test_data/preprocessed_img55.png")?.to_luma();
-        let train_img2 = open("test_data/preprocessed_img224.png")?.to_luma();
-        let train_gt_img1 = open("test_data/gt_img55.png")?.to_luma();
-        let train_gt_img2 = open("test_data/gt_img224.png")?.to_luma();
-        let train_mask_img1 = open("test_data/mask_img55.png")?.to_luma();
-        let train_mask_img2 = open("test_data/mask_img224.png")?.to_luma();
+        let train_img1 = open("test_data/preprocessed_img224.png")?.to_luma();
+        let train_img2 = open("test_data/preprocessed_img55.png")?.to_luma();
+        let train_gt_img1 = open("test_data/gt_img224.png")?.to_luma();
+        let train_gt_img2 = open("test_data/gt_img55.png")?.to_luma();
+        let train_mask_img1 = open("test_data/mask_img224.png")?.to_luma();
+        let train_mask_img2 = open("test_data/mask_img55.png")?.to_luma();
         let test_img1 = open("test_data/preprocessed_img494.png")?.to_luma();
         let test_img2 = open("test_data/preprocessed_img545.png")?.to_luma();
         let test_gt_img1 = open("test_data/gt_img494.png")?.to_luma();
@@ -816,94 +827,126 @@ mod tests {
         let train_images_tensor = Tensor::load(&filenames[0])?;
         assert_eq!(train_images_tensor.size(), [2, 800, 800]);
         assert_eq!(
-            train_images_tensor.get(0).to_kind(Kind::Double),
-            convert_image_to_tensor(&train_img1)?
+            train_images_tensor
+                .get(0)
+                .to_kind(Kind::Double)
+                .to_string(80)?,
+            convert_image_to_tensor(&train_img1)?.to_string(80)?
         );
         assert_eq!(
-            train_images_tensor.get(1).to_kind(Kind::Double),
-            convert_image_to_tensor(&train_img2)?
+            train_images_tensor
+                .get(1)
+                .to_kind(Kind::Double)
+                .to_string(80)?,
+            convert_image_to_tensor(&train_img2)?.to_string(80)?
         );
 
         let train_gts_tensor = Tensor::load(&filenames[1])?;
         assert_eq!(train_gts_tensor.size(), [2, 800, 800]);
         assert_eq!(
-            train_gts_tensor.get(0).to_kind(Kind::Double),
-            convert_image_to_tensor(&train_gt_img1)? / 255.
+            train_gts_tensor
+                .get(0)
+                .to_kind(Kind::Double)
+                .to_string(80)?,
+            (convert_image_to_tensor(&train_gt_img1)? / 255.).to_string(80)?
         );
         assert_eq!(
-            train_gts_tensor.get(1).to_kind(Kind::Double),
-            convert_image_to_tensor(&train_gt_img2)? / 255.
+            train_gts_tensor
+                .get(1)
+                .to_kind(Kind::Double)
+                .to_string(80)?,
+            (convert_image_to_tensor(&train_gt_img2)? / 255.).to_string(80)?
         );
 
         let train_masks_tensor = Tensor::load(&filenames[2])?;
         assert_eq!(train_masks_tensor.size(), [2, 800, 800]);
         assert_eq!(
-            train_masks_tensor.get(0).to_kind(Kind::Double),
-            convert_image_to_tensor(&train_mask_img1)? / 255.
+            train_masks_tensor
+                .get(0)
+                .to_kind(Kind::Double)
+                .to_string(80)?,
+            (convert_image_to_tensor(&train_mask_img1)? / 255.).to_string(80)?
         );
         assert_eq!(
-            train_masks_tensor.get(1).to_kind(Kind::Double),
-            convert_image_to_tensor(&train_mask_img2)? / 255.
+            train_masks_tensor
+                .get(1)
+                .to_kind(Kind::Double)
+                .to_string(80)?,
+            (convert_image_to_tensor(&train_mask_img2)? / 255.).to_string(80)?
         );
 
         let train_adj_tensor = Tensor::load(&filenames[3])?;
         assert_eq!(train_adj_tensor.size(), [2, 2]);
 
-        let mut original_dim = (300., 200.);
-        let mut resized = (800., 533.);
+        let mut original_dim = (180., 240.);
+        let mut resized = (600., 800.);
         assert_eq!(
-            train_adj_tensor.get(0),
+            train_adj_tensor.get(0).to_string(80)?,
             Tensor::of_slice(&[resized.0 / original_dim.0, resized.1 / original_dim.1])
+                .to_string(80)?
         );
 
-        original_dim = (180., 240.);
-        resized = (600., 800.);
+        original_dim = (300., 200.);
+        resized = (800., 533.);
         assert_eq!(
-            train_adj_tensor.get(1),
+            train_adj_tensor.get(1).to_string(80)?,
             Tensor::of_slice(&[resized.0 / original_dim.0, resized.1 / original_dim.1])
+                .to_string(80)?
         );
 
         let train_polygons_vec = image_ops::load_polygons_vec_from_file(&filenames[4])?;
         assert_eq!(train_polygons_vec.0.len(), 2);
-        assert_eq!(train_polygons_vec.0[0].0.len(), 4);
-        assert_eq!(train_polygons_vec.0[1].0.len(), 3);
+        assert_eq!(train_polygons_vec.0[0].0.len(), 3);
+        assert_eq!(train_polygons_vec.0[1].0.len(), 4);
 
         let train_ignore_flags_vec = image_ops::load_ignore_flags_vec_from_file(&filenames[5])?;
         assert_eq!(train_ignore_flags_vec.len(), 2);
-        assert_eq!(train_ignore_flags_vec[0].len(), 4);
-        assert_eq!(train_ignore_flags_vec[1].len(), 3);
+        assert_eq!(train_ignore_flags_vec[0].len(), 3);
+        assert_eq!(train_ignore_flags_vec[1].len(), 4);
 
         let test_images_tensor = Tensor::load(&filenames[6])?;
         assert_eq!(test_images_tensor.size(), [2, 800, 800]);
         assert_eq!(
-            test_images_tensor.get(0).to_kind(Kind::Double),
-            convert_image_to_tensor(&test_img1)?
+            test_images_tensor
+                .get(0)
+                .to_kind(Kind::Double)
+                .to_string(80)?,
+            convert_image_to_tensor(&test_img1)?.to_string(80)?
         );
         assert_eq!(
-            test_images_tensor.get(1).to_kind(Kind::Double),
-            convert_image_to_tensor(&test_img2)?
+            test_images_tensor
+                .get(1)
+                .to_kind(Kind::Double)
+                .to_string(80)?,
+            convert_image_to_tensor(&test_img2)?.to_string(80)?
         );
 
         let test_gts_tensor = Tensor::load(&filenames[7])?;
         assert_eq!(test_gts_tensor.size(), [2, 800, 800]);
         assert_eq!(
-            test_gts_tensor.get(0).to_kind(Kind::Double),
-            convert_image_to_tensor(&test_gt_img1)? / 255.
+            test_gts_tensor.get(0).to_kind(Kind::Double).to_string(80)?,
+            (convert_image_to_tensor(&test_gt_img1)? / 255.).to_string(80)?
         );
         assert_eq!(
-            test_gts_tensor.get(1).to_kind(Kind::Double),
-            convert_image_to_tensor(&test_gt_img2)? / 255.
+            test_gts_tensor.get(1).to_kind(Kind::Double).to_string(80)?,
+            (convert_image_to_tensor(&test_gt_img2)? / 255.).to_string(80)?
         );
 
         let test_masks_tensor = Tensor::load(&filenames[8])?;
         assert_eq!(test_masks_tensor.size(), [2, 800, 800]);
         assert_eq!(
-            test_masks_tensor.get(0).to_kind(Kind::Double),
-            convert_image_to_tensor(&test_mask_img1)? / 255.
+            test_masks_tensor
+                .get(0)
+                .to_kind(Kind::Double)
+                .to_string(80)?,
+            (convert_image_to_tensor(&test_mask_img1)? / 255.).to_string(80)?
         );
         assert_eq!(
-            test_masks_tensor.get(1).to_kind(Kind::Double),
-            convert_image_to_tensor(&test_mask_img2)? / 255.
+            test_masks_tensor
+                .get(1)
+                .to_kind(Kind::Double)
+                .to_string(80)?,
+            (convert_image_to_tensor(&test_mask_img2)? / 255.).to_string(80)?
         );
 
         let test_adj_tensor = Tensor::load(&filenames[9])?;
@@ -922,15 +965,17 @@ mod tests {
         original_dim = (200., 200.);
         resized = (800., 800.);
         assert_eq!(
-            test_adj_tensor.get(0),
+            test_adj_tensor.get(0).to_string(80)?,
             Tensor::of_slice(&[resized.0 / original_dim.0, resized.1 / original_dim.1])
+                .to_string(80)?
         );
 
         original_dim = (184., 274.);
         resized = (537., 800.);
         assert_eq!(
-            test_adj_tensor.get(1),
+            test_adj_tensor.get(1).to_string(80)?,
             Tensor::of_slice(&[resized.0 / original_dim.0, resized.1 / original_dim.1])
+                .to_string(80)?
         );
 
         // cleanup generated files

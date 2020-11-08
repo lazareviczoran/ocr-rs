@@ -1,0 +1,37 @@
+version: v1.0
+name: ocr-rs CI pipeline
+agent:
+  machine:
+    type: e1-standard-2
+
+  containers:
+    - name: main
+      image: 'lazareviczoran/ocr-rs:0.0.3'
+
+blocks:
+  - name: 'Build'
+    task:
+      jobs:
+        - name: 'Build'
+          commands:
+            - checkout
+            - cargo build -v
+
+  - name: 'fmt'
+    task:
+      jobs:
+        - name: 'fmt'
+          commands:
+            - checkout
+            - rustup component add rustfmt
+            - cargo fmt --all -- --check
+
+  - name: 'Tests'
+    task:
+      prologue:
+        commands:
+          - checkout
+      jobs:
+        - name: 'Unit tests'
+          commands:
+            - cargo test -v
