@@ -7,6 +7,7 @@ use super::image_ops;
 use super::{measure_time, DEVICE};
 use crate::utils::save_vs;
 use anyhow::{anyhow, Result};
+use itertools::izip;
 use log::{debug, info};
 use metrics::{gather_measure, get_boxes_and_box_scores, validate_measure};
 use model::resnet18;
@@ -98,6 +99,7 @@ pub fn train_model(opts: &TextDetOptions) -> Result<FuncT<'static>> {
         opts.image_dimensions.0 as i64,
         opts.image_dimensions.1 as i64,
     );
+    let target_chunk_size = 4;
     for epoch in 1..=epoch_limit {
         measure_time!("training single batch", || -> Result<()> {
             for (i, images_batch) in dataset_paths.train_images.iter().enumerate() {
@@ -105,16 +107,21 @@ pub fn train_model(opts: &TextDetOptions) -> Result<FuncT<'static>> {
                 let image = Tensor::load(&images_batch)?
                     .view((-1, 1, h, w))
                     .to_kind(Kind::Float);
+                let num_of_chunks =
+                    (image.size()[0] as f32 / target_chunk_size as f32).ceil() as i64;
                 let gt = Tensor::load(&dataset_paths.train_gt[i])?;
                 let mask = Tensor::load(&dataset_paths.train_mask[i])?;
-                for j in 0..image.size()[0] {
-                    let pred = measure_time!("single training pred", || net
-                        .forward_t(&image.get(j).view((1, 1, h, w)), true));
-                    let loss = measure_time!("single training loss", || calculate_balance_loss(
-                        pred,
-                        gt.get(j),
-                        mask.get(j)
-                    ));
+                for (images_chunk, gt_chunk, mask_chunk) in izip!(
+                    image.chunk(num_of_chunks, 0).iter(),
+                    gt.chunk(num_of_chunks, 0).iter(),
+                    mask.chunk(num_of_chunks, 0).iter()
+                ) {
+                    let pred = measure_time!("single training pred", || {
+                        net.forward_t(&images_chunk, true)
+                    });
+                    let loss = measure_time!("single training loss", || {
+                        calculate_balance_loss(&pred, gt_chunk, mask_chunk)
+                    });
                     measure_time!("single training backward step", || opt.backward_step(&loss));
                 }
                 save_vs(&vs, opts.model_file_path)?;
@@ -141,12 +148,12 @@ pub fn train_model(opts: &TextDetOptions) -> Result<FuncT<'static>> {
 ///     gt: shape (N, H, W), the target
 ///     mask: shape (N, H, W), the mask indicates positive regions
 ///
-fn calculate_balance_loss(pred: Tensor, gt: Tensor, mask: Tensor) -> Tensor {
+fn calculate_balance_loss(pred: &Tensor, gt: &Tensor, mask: &Tensor) -> Tensor {
     let negative_ratio = 3.0;
     let eps = 1e-6;
 
-    let positive = &gt * &mask;
-    let negative: Tensor = (1 - &gt) * mask;
+    let positive = gt * mask;
+    let negative: Tensor = (1 - gt) * mask;
     let positive_count = positive.sum(Kind::Float);
     let negative_count = negative
         .sum(Kind::Float)
@@ -173,41 +180,42 @@ fn get_model_accuracy(
 ) -> Result<(f64, f64, f64)> {
     let mut raw_metrics = Vec::new();
     let (w, h) = (dimensions.0 as i64, dimensions.1 as i64);
+    let target_chunk = 4;
     for i in 0..dataset_paths.test_images.len() {
         debug!("Calculating accuracy for batch {}", i);
         let images = Tensor::load(&dataset_paths.test_images[i])?
             .view((-1, 1, h, w))
             .to_kind(Kind::Float);
+        let num_of_chunks = (images.size()[0] as f32 / target_chunk as f32).ceil() as i64;
         let adjs = Tensor::load(&dataset_paths.test_adj[i])?;
         let polys = image_ops::load_polygons_vec_from_file(&dataset_paths.test_polys[i])?;
         let ignore_flags =
             image_ops::load_ignore_flags_vec_from_file(&dataset_paths.test_ignore_flags[i])?;
-        let mut metrics = Vec::with_capacity(images.size()[0] as usize);
-        for j in 0..images.size()[0] {
-            debug!("starting validate_measure for image {}", j);
+        for (images_chunk, adjs_chunk, polys_chunk, flags_chunk) in izip!(
+            images.chunk(num_of_chunks, 0).iter(),
+            adjs.chunk(num_of_chunks, 0).iter(),
+            polys.0.chunks(target_chunk),
+            ignore_flags.chunks(target_chunk)
+        ) {
+            debug!("starting validate_measure for chunk");
             let pred = measure_time!("accuracy calc -> inference", || net
-                .forward_t(&images.get(j).view((-1, 1, h, w)), false));
+                .forward_t(&images_chunk, false));
             let (boxes, scores) = measure_time!(
                 "box_scores_time",
                 || -> Result<(image_ops::BatchPolygons, Vec<Vec<f64>>)> {
-                    let res = get_boxes_and_box_scores(
-                        &pred,
-                        &adjs.get(j).view((-1, 2)),
-                        is_output_polygon,
-                    )?;
+                    let res = get_boxes_and_box_scores(&pred, &adjs_chunk, is_output_polygon)?;
                     Ok(res)
                 }
             )?;
-            metrics.push(measure_time!(
+            raw_metrics.push(measure_time!(
                 "validation",
-                || -> Result<metrics::MetricsItem> {
-                    let res = validate_measure(&polys, &ignore_flags, &boxes, &scores, j as usize)?;
+                || -> Result<Vec<metrics::MetricsItem>> {
+                    let res = validate_measure(&polys_chunk, &flags_chunk, &boxes, &scores, true)?;
                     Ok(res)
                 }
             )?);
-            debug!("completed validate_measure for image {}", j);
+            debug!("completed validate_measure for image chunk");
         }
-        raw_metrics.push(metrics);
     }
     let metrics = gather_measure(&raw_metrics)?;
     Ok(metrics)

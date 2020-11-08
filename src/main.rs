@@ -1,8 +1,6 @@
 #[macro_use]
 extern crate lazy_static;
 extern crate clap;
-extern crate geo;
-extern crate geo_booleanop;
 extern crate log;
 extern crate log4rs;
 extern crate tch;

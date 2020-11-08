@@ -2,11 +2,12 @@ use crate::image_ops::{self, BatchPolygons, MultiplePolygons};
 use anyhow::Result;
 use geo::prelude::*;
 use geo::{LineString, Polygon};
-use geo_booleanop::boolean::BooleanOp;
+use geo_clipper::Clipper;
 use image::{GrayImage, Luma};
 use imageproc::contours::{approx_poly_dp, arc_length, find_contours, get_distance, min_area_rect};
 use imageproc::definitions::{HasWhite, Point};
 use imageproc::drawing::{self};
+use itertools::izip;
 use num_traits::clamp;
 use std::sync::Mutex;
 use tch::{Kind, Tensor};
@@ -218,27 +219,34 @@ pub fn box_score_fast(bitmap: &Tensor, points: &[Point<u32>]) -> Result<f64> {
 //      pred: vector of length N of predicted polygons (each tensor of shape (M, 2) coresponds to a single image)
 //      scores: vector of length N of predicted polygons scores
 pub fn validate_measure(
-    polygons: &BatchPolygons,
+    polygons: &[MultiplePolygons],
     ignore_tags: &[Vec<bool>],
     pred: &BatchPolygons,
     scores: &[Vec<f64>],
-    idx: usize,
-    // is_output_polygon: bool,
-) -> Result<MetricsItem> {
-    let is_output_polygon = true;
+    is_output_polygon: bool,
+) -> Result<Vec<MetricsItem>> {
     let box_thresh = 0.6;
-    let mut pred_polygons = Vec::new();
-    for j in 0..pred.0[0].0.len() {
-        if is_output_polygon || scores[0][j] >= box_thresh {
-            pred_polygons.push(pred.0[0].0[j].clone());
+    let mut result = Vec::with_capacity(polygons.len());
+    for (curr_polygons, curr_ignore_flags, curr_pred, curr_scores) in izip!(
+        polygons.iter(),
+        ignore_tags.iter(),
+        pred.0.iter(),
+        scores.iter()
+    ) {
+        let mut pred_polygons = Vec::new();
+        for (&score, pred) in curr_scores.iter().zip(curr_pred.0.iter()) {
+            if is_output_polygon || score >= box_thresh {
+                pred_polygons.push(pred.clone());
+            }
         }
-    }
 
-    evaluate_image(
-        &polygons.0[idx],
-        &ignore_tags[idx],
-        &MultiplePolygons(pred_polygons),
-    )
+        result.push(evaluate_image(
+            &curr_polygons,
+            &curr_ignore_flags,
+            &MultiplePolygons(pred_polygons),
+        )?);
+    }
+    Ok(result)
 }
 
 pub fn gather_measure(metrics: &[Vec<MetricsItem>]) -> Result<(f64, f64, f64)> {
@@ -401,12 +409,12 @@ pub fn evaluate_image(
 }
 
 fn get_intersection(poly1: &Polygon<f64>, poly2: &Polygon<f64>) -> Result<f64> {
-    let intersection = poly1.intersection(poly2);
+    let intersection = poly1.intersection(poly2, 1.);
     Ok(intersection.unsigned_area())
 }
 
 fn get_union(poly1: &Polygon<f64>, poly2: &Polygon<f64>) -> Result<f64> {
-    let union = poly1.union(poly2);
+    let union = poly1.union(poly2, 1.);
     Ok(union.unsigned_area())
 }
 
@@ -710,7 +718,7 @@ mod tests {
 
         let pred_tensor = (convert_image_to_tensor(&polygons_image)? / 255.).view((1, h, w));
         // no adjustment
-        let adjust_values = Tensor::of_slice(&[1., 1.]).view((1, 2));
+        let adjust_values = Tensor::of_slice(&[1., 1.]);
         let expected_boxes = MultiplePolygons(vec![
             image_ops::Polygon {
                 points: vec![
@@ -796,7 +804,7 @@ mod tests {
 
         let pred_tensor = (convert_image_to_tensor(&polygons_image)? / 255.).view((1, h, w));
         // resized by w x 2, h x 2
-        let adjust_values = Tensor::of_slice(&[2., 2.]).view((1, 2));
+        let adjust_values = Tensor::of_slice(&[2., 2.]);
         let expected_boxes = MultiplePolygons(vec![
             image_ops::Polygon {
                 points: vec![
@@ -1005,91 +1013,92 @@ mod tests {
         Ok(())
     }
 
-    // #[test]
-    // fn validate_measure_test() -> Result<()> {
-    //     let gt_polygons_tensor = BatchPolygons(vec![
-    //         // image 1
-    //         MultiplePolygons(vec![
-    //             image_ops::Polygon {
-    //                 points: vec![
-    //                     Point::new(0, 0),
-    //                     Point::new(10, 0),
-    //                     Point::new(10, 10),
-    //                     Point::new(0, 10),
-    //                 ],
-    //             }, // poly 1
-    //             image_ops::Polygon {
-    //                 points: vec![
-    //                     Point::new(20, 20),
-    //                     Point::new(30, 20),
-    //                     Point::new(30, 30),
-    //                     Point::new(20, 30),
-    //                 ],
-    //             }, // poly 2
-    //         ]),
-    //         // image 2
-    //         MultiplePolygons(vec![
-    //             image_ops::Polygon {
-    //                 points: vec![
-    //                     Point::new(0, 0),
-    //                     Point::new(10, 0),
-    //                     Point::new(10, 10),
-    //                     Point::new(0, 10),
-    //                 ],
-    //             }, // poly 1
-    //             image_ops::Polygon {
-    //                 points: vec![
-    //                     Point::new(20, 20),
-    //                     Point::new(30, 20),
-    //                     Point::new(30, 30),
-    //                     Point::new(20, 30),
-    //                 ],
-    //             }, // poly 2
-    //         ]),
-    //     ]);
-    //     let ignore_polygons = [
-    //         vec![false, false], // image 1
-    //         vec![false, false], // image 2
-    //     ];
-    //     let pred = BatchPolygons(vec![
-    //         MultiplePolygons(vec![image_ops::Polygon {
-    //             points: vec![
-    //                 Point::new(1, 1),
-    //                 Point::new(10, 0),
-    //                 Point::new(10, 10),
-    //                 Point::new(0, 10),
-    //             ],
-    //         }]),
-    //         MultiplePolygons(vec![image_ops::Polygon {
-    //             points: vec![
-    //                 Point::new(45, 61),
-    //                 Point::new(47, 41),
-    //                 Point::new(60, 60),
-    //                 Point::new(39, 48),
-    //             ],
-    //         }]),
-    //     ]);
-    //     let scores = [vec![0.9], vec![0.9]];
-    //     let metrics = validate_measure(&gt_polygons_tensor, &ignore_polygons, &pred, &scores)?;
-    //     assert_eq!(metrics.len(), 2);
+    #[test]
+    fn validate_measure_test() -> Result<()> {
+        let gt_polygons_tensor = vec![
+            // image 1
+            MultiplePolygons(vec![
+                image_ops::Polygon {
+                    points: vec![
+                        Point::new(0, 0),
+                        Point::new(10, 0),
+                        Point::new(10, 10),
+                        Point::new(0, 10),
+                    ],
+                }, // poly 1
+                image_ops::Polygon {
+                    points: vec![
+                        Point::new(20, 20),
+                        Point::new(30, 20),
+                        Point::new(30, 30),
+                        Point::new(20, 30),
+                    ],
+                }, // poly 2
+            ]),
+            // image 2
+            MultiplePolygons(vec![
+                image_ops::Polygon {
+                    points: vec![
+                        Point::new(0, 0),
+                        Point::new(10, 0),
+                        Point::new(10, 10),
+                        Point::new(0, 10),
+                    ],
+                }, // poly 1
+                image_ops::Polygon {
+                    points: vec![
+                        Point::new(20, 20),
+                        Point::new(30, 20),
+                        Point::new(30, 30),
+                        Point::new(20, 30),
+                    ],
+                }, // poly 2
+            ]),
+        ];
+        let ignore_polygons = [
+            vec![false, false], // image 1
+            vec![false, false], // image 2
+        ];
+        let pred = BatchPolygons(vec![
+            MultiplePolygons(vec![image_ops::Polygon {
+                points: vec![
+                    Point::new(1, 1),
+                    Point::new(10, 0),
+                    Point::new(10, 10),
+                    Point::new(0, 10),
+                ],
+            }]),
+            MultiplePolygons(vec![image_ops::Polygon {
+                points: vec![
+                    Point::new(45, 61),
+                    Point::new(47, 41),
+                    Point::new(60, 60),
+                    Point::new(39, 48),
+                ],
+            }]),
+        ]);
+        let scores = [vec![0.9], vec![0.9]];
+        let metrics =
+            validate_measure(&gt_polygons_tensor, &ignore_polygons, &pred, &scores, true)?;
+        assert_eq!(metrics.len(), 2);
 
-    //     // image 1 metrics (having 1 matched polygon)
-    //     assert_eq!(metrics[0].gt_care, 2);
-    //     assert_eq!(metrics[0].det_care, 1);
-    //     assert_eq!(metrics[0].det_matched, 1);
-    //     assert!(metrics[0].precision - 1. < ERROR_THRESHOLD);
-    //     assert!(metrics[0].recall - 0.5 < ERROR_THRESHOLD);
-    //     assert!(metrics[0].hmean - 0.6666666666666666 < ERROR_THRESHOLD);
+        // image 1 metrics (having 1 matched polygon)
+        assert_eq!(metrics[0].gt_care, 2);
+        assert_eq!(metrics[0].det_care, 1);
+        assert_eq!(metrics[0].det_matched, 1);
+        assert!((metrics[0].precision - 1.).abs() < f64::EPSILON);
+        assert!((metrics[0].recall - 0.5).abs() < f64::EPSILON);
+        assert!((metrics[0].hmean - 0.6666666666666666).abs() < f64::EPSILON);
 
-    //     // image 2 metrics (having 0 matched polygons)
-    //     assert_eq!(metrics[1].gt_care, 2);
-    //     assert_eq!(metrics[1].det_care, 1);
-    //     assert_eq!(metrics[1].det_matched, 0);
-    //     assert!(metrics[1].precision < ERROR_THRESHOLD);
-    //     assert!(metrics[1].recall < ERROR_THRESHOLD);
-    //     assert!(metrics[1].hmean < ERROR_THRESHOLD);
-    //     Ok(())
-    // }
+        // image 2 metrics (having 0 matched polygons)
+        assert_eq!(metrics[1].gt_care, 2);
+        assert_eq!(metrics[1].det_care, 1);
+        assert_eq!(metrics[1].det_matched, 0);
+        assert!(metrics[1].precision < f64::EPSILON);
+        assert!(metrics[1].recall < f64::EPSILON);
+        assert!(metrics[1].hmean < f64::EPSILON);
+        Ok(())
+    }
 
     #[test]
     fn combine_results_test() -> Result<()> {
