@@ -1,5 +1,7 @@
 # ocr-rs
 
+[![Build Status](https://lazareviczoran.semaphoreci.com/badges/ocr-rs.svg?style=shields)](https://lazareviczoran.semaphoreci.com/projects/ocr-rs)
+
 An OCR application for detecting and recognizing text (containing latin characters and numbers) of various scales and shapes (horizontal/multi-oriented/curved).
 
 <img src="./pipeline.png" align="left" width="100%" >
