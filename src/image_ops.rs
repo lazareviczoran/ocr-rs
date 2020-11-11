@@ -2,13 +2,14 @@ use super::dataset::TextDetectionDataset;
 use super::measure_time;
 use super::utils::{save_tensor, VALUES_COUNT, VALUES_MAP};
 use anyhow::{anyhow, Result};
+use geo::{LineString, MultiPolygon, Polygon};
 use image::{imageops::FilterType, open, DynamicImage, GrayImage, ImageBuffer, Luma};
 use imageproc::definitions::{HasBlack, HasWhite, Point};
 use imageproc::drawing::draw_polygon_mut;
 use log::{error, info, trace};
 use rayon::prelude::*;
 use regex::Regex;
-use serde::{Deserialize, Deserializer, Serialize, Serializer};
+use serde::Serialize;
 use std::collections::BTreeSet;
 use std::fs::{self, File};
 use std::io::prelude::*;
@@ -216,7 +217,7 @@ pub fn preprocess_image<T: AsRef<Path>>(
 }
 
 fn generate_gt_and_mask_images(
-    polygons: &MultiplePolygons,
+    polygons: &MultiPolygon<u32>,
     adjust_x: f64,
     adjust_y: f64,
     target_dim: (u32, u32),
@@ -228,25 +229,27 @@ fn generate_gt_and_mask_images(
     let mut mask_image = mask_temp.to_luma();
     let mut ignore_flags = vec![false; polygons.0.len()];
     for (pos, poly) in polygons.0.iter().enumerate() {
-        let num_of_points = poly.points.len();
+        let ext_poly = poly.exterior();
         let (min_x, max_x, min_y, max_y) =
-            poly.points
-                .iter()
+            ext_poly
+                .points_iter()
                 .fold((std::u32::MAX, 0, std::u32::MAX, 0), |acc, p| {
                     (
-                        acc.0.min(p.x),
-                        acc.1.max(p.x),
-                        acc.2.min(p.y),
-                        acc.3.max(p.y),
+                        acc.0.min(p.x()),
+                        acc.1.max(p.x()),
+                        acc.2.min(p.y()),
+                        acc.3.max(p.y()),
                     )
                 });
         let poly_width = max_x - min_x;
         let poly_height = max_y - min_y;
-        let poly_values = (0..num_of_points)
-            .map(|i| {
+        let poly_values = ext_poly
+            .points_iter()
+            .take(ext_poly.num_coords() - 1)
+            .map(|p| {
                 Point::new(
-                    (poly.points[i].x as f64 * adjust_x) as i32,
-                    (poly.points[i].y as f64 * adjust_y) as i32,
+                    (p.x() as f64 * adjust_x) as i32,
+                    (p.y() as f64 * adjust_y) as i32,
                 )
             })
             .collect::<Vec<Point<i32>>>();
@@ -264,11 +267,11 @@ fn generate_gt_and_mask_images(
     Ok((gt_image, mask_image, ignore_flags))
 }
 
-fn load_polygons<T: AsRef<Path>>(file_path: T) -> Result<MultiplePolygons> {
+fn load_polygons<T: AsRef<Path>>(file_path: T) -> Result<MultiPolygon<u32>> {
     if let Ok(mut file) = File::open(file_path.as_ref()) {
         let mut content = String::new();
         file.read_to_string(&mut content)?;
-        let polygons = content
+        let polygons: Vec<Polygon<u32>> = content
             .split_terminator('\n')
             .collect::<Vec<&str>>()
             .par_iter()
@@ -282,15 +285,18 @@ fn load_polygons<T: AsRef<Path>>(file_path: T) -> Result<MultiplePolygons> {
                     .iter()
                     .flat_map(|v| v.parse())
                     .collect::<Vec<u32>>();
-                Polygon {
-                    points: values
-                        .chunks_exact(2)
-                        .map(|point| Point::new(point[0], point[1]))
-                        .collect(),
-                }
+                Polygon::new(
+                    LineString::from(
+                        values
+                            .chunks_exact(2)
+                            .map(|point| (point[0], point[1]))
+                            .collect::<Vec<(u32, u32)>>(),
+                    ),
+                    vec![],
+                )
             })
             .collect();
-        Ok(MultiplePolygons(polygons))
+        Ok(MultiPolygon::from(polygons))
     } else {
         Err(anyhow!("didn't find file {}", file_path.as_ref().display()))
     }
@@ -300,7 +306,7 @@ pub fn load_text_detection_image<T: AsRef<Path>, H: AsRef<Path>>(
     images_base_dir: T,
     file_path: H,
     target_dim: (u32, u32),
-) -> Result<(Tensor, Tensor, Tensor, Tensor, MultiplePolygons, Vec<bool>)> {
+) -> Result<SingleImageData> {
     let path = file_path.as_ref();
     let (preprocessed_image, adjust_x, adjust_y) = preprocess_image(path, target_dim)?;
 
@@ -320,7 +326,7 @@ pub fn load_text_detection_image<T: AsRef<Path>, H: AsRef<Path>>(
     let mask_tensor = (convert_image_to_tensor(&mask_image)? / 255.).to_kind(Kind::Uint8);
     let adjust_tensor = Tensor::of_slice(&[adjust_x, adjust_y]).view((1, 2));
 
-    Ok((
+    Ok(SingleImageData::new(
         image_tensor.view((1, target_dim.1 as i64, target_dim.0 as i64)),
         gt_tensor.view((1, target_dim.1 as i64, target_dim.0 as i64)),
         mask_tensor.view((1, target_dim.1 as i64, target_dim.0 as i64)),
@@ -458,50 +464,13 @@ pub fn load_text_detection_tensor_files<T: AsRef<Path>>(
     }
 }
 
-#[derive(Serialize, Deserialize, Copy, Clone, Debug, PartialEq, Eq)]
-pub struct PointDef<T: Copy + PartialEq + Eq> {
-    pub x: T,
-    pub y: T,
-}
-impl<T: Copy + PartialEq + Eq> From<Point<T>> for PointDef<T> {
-    fn from(def: Point<T>) -> Self {
-        Self { x: def.x, y: def.y }
-    }
-}
-
-fn points_vec_ser<S: Serializer>(vec: &[Point<u32>], serializer: S) -> Result<S::Ok, S::Error> {
-    let vec2: Vec<PointDef<u32>> = vec.iter().map(|x| PointDef::from(*x)).collect();
-
-    vec2.serialize(serializer)
-}
-fn points_vec_deser<'de, D: Deserializer<'de>>(
-    deserializer: D,
-) -> Result<Vec<Point<u32>>, D::Error> {
-    let vec: Vec<PointDef<u32>> = Deserialize::deserialize(deserializer)?;
-
-    Ok(vec.iter().map(|p| Point::<u32>::new(p.x, p.y)).collect())
-}
-
-#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
-pub struct Polygon {
-    #[serde(serialize_with = "points_vec_ser")]
-    #[serde(deserialize_with = "points_vec_deser")]
-    pub points: Vec<Point<u32>>,
-}
-
-#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
-pub struct MultiplePolygons(pub Vec<Polygon>);
-
-#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
-pub struct BatchPolygons(pub Vec<MultiplePolygons>);
-
 #[derive(Debug)]
 pub struct TextDetDataBatch {
     images: Tensor,
     gts: Tensor,
     masks: Tensor,
     adjs_values: Tensor,
-    polygons: Vec<MultiplePolygons>,
+    polygons: Vec<MultiPolygon<u32>>,
     ignore_flags: Vec<Vec<bool>>,
 }
 impl TextDetDataBatch {
@@ -513,6 +482,34 @@ impl TextDetDataBatch {
             adjs_values: Tensor::of_slice(&[0]),
             polygons: Vec::new(),
             ignore_flags: Vec::new(),
+        }
+    }
+}
+
+pub struct SingleImageData {
+    image_tensor: Tensor,
+    gt_tensor: Tensor,
+    mask_tensor: Tensor,
+    adjs_tensor: Tensor,
+    polygons: MultiPolygon<u32>,
+    ignore_flags: Vec<bool>,
+}
+impl SingleImageData {
+    pub fn new(
+        image_tensor: Tensor,
+        gt_tensor: Tensor,
+        mask_tensor: Tensor,
+        adjs_tensor: Tensor,
+        polygons: MultiPolygon<u32>,
+        ignore_flags: Vec<bool>,
+    ) -> Self {
+        Self {
+            image_tensor,
+            gt_tensor,
+            mask_tensor,
+            adjs_tensor,
+            polygons,
+            ignore_flags,
         }
     }
 }
@@ -544,20 +541,24 @@ pub fn generate_text_det_tensor_chunks<T: AsRef<Path>>(
                             .is_some()
                         {
                             match load_text_detection_image(base_dir, file.path(), dim) {
-                                Ok((im, gt, mask, adj_values, polygons, ignore_flags)) => {
-                                    acc.polygons.push(polygons);
-                                    acc.ignore_flags.push(ignore_flags);
+                                Ok(image_data) => {
+                                    acc.polygons.push(image_data.polygons);
+                                    acc.ignore_flags.push(image_data.ignore_flags);
                                     if acc.images.numel() == 1 {
-                                        acc.images = im;
-                                        acc.gts = gt;
-                                        acc.masks = mask;
-                                        acc.adjs_values = adj_values;
+                                        acc.images = image_data.image_tensor;
+                                        acc.gts = image_data.gt_tensor;
+                                        acc.masks = image_data.mask_tensor;
+                                        acc.adjs_values = image_data.adjs_tensor;
                                     } else {
-                                        acc.images = Tensor::cat(&[acc.images, im], 0);
-                                        acc.gts = Tensor::cat(&[acc.gts, gt], 0);
-                                        acc.masks = Tensor::cat(&[acc.masks, mask], 0);
-                                        acc.adjs_values =
-                                            Tensor::cat(&[acc.adjs_values, adj_values], 0);
+                                        acc.images =
+                                            Tensor::cat(&[acc.images, image_data.image_tensor], 0);
+                                        acc.gts = Tensor::cat(&[acc.gts, image_data.gt_tensor], 0);
+                                        acc.masks =
+                                            Tensor::cat(&[acc.masks, image_data.mask_tensor], 0);
+                                        acc.adjs_values = Tensor::cat(
+                                            &[acc.adjs_values, image_data.adjs_tensor],
+                                            0,
+                                        );
                                     }
                                 }
                                 Err(msg) => {
@@ -659,7 +660,7 @@ pub fn save_batch<T: AsRef<Path>>(
         error!("Error while saving adj tensor {}", msg);
     }
     if let Err(msg) = save_batch_polygons(
-        &BatchPolygons(batch.polygons),
+        &batch.polygons,
         target_dir.join(format!("{}{}", polys_file, idx)),
         true,
     ) {
@@ -693,7 +694,7 @@ fn save_vec_to_file<T: Serialize, H: AsRef<Path>>(
 }
 
 fn save_batch_polygons<T: AsRef<Path>>(
-    polygons: &BatchPolygons,
+    polygons: &[MultiPolygon<u32>],
     file_path: T,
     overwrite: bool,
 ) -> Result<()> {
@@ -710,7 +711,7 @@ fn save_batch_polygons<T: AsRef<Path>>(
     Ok(())
 }
 
-pub fn load_polygons_vec_from_file<T: AsRef<Path>>(file_path: T) -> Result<BatchPolygons> {
+pub fn load_polygons_vec_from_file<T: AsRef<Path>>(file_path: T) -> Result<Vec<MultiPolygon<u32>>> {
     let path = file_path.as_ref();
     if !path.exists() {
         return Err(anyhow!("file {} doesn't exists", path.display()));
@@ -905,9 +906,9 @@ mod tests {
         );
 
         let train_polygons_vec = image_ops::load_polygons_vec_from_file(&filenames[4])?;
-        assert_eq!(train_polygons_vec.0.len(), 2);
-        assert_eq!(train_polygons_vec.0[0].0.len(), 3);
-        assert_eq!(train_polygons_vec.0[1].0.len(), 4);
+        assert_eq!(train_polygons_vec.len(), 2);
+        assert_eq!(train_polygons_vec[0].0.len(), 3);
+        assert_eq!(train_polygons_vec[1].0.len(), 4);
 
         let train_ignore_flags_vec = image_ops::load_ignore_flags_vec_from_file(&filenames[5])?;
         assert_eq!(train_ignore_flags_vec.len(), 2);
@@ -963,9 +964,9 @@ mod tests {
         assert_eq!(test_adj_tensor.size(), [2, 2]);
 
         let test_polygons_vec = image_ops::load_polygons_vec_from_file(&filenames[10])?;
-        assert_eq!(test_polygons_vec.0.len(), 2);
-        assert_eq!(test_polygons_vec.0[0].0.len(), 3);
-        assert_eq!(test_polygons_vec.0[1].0.len(), 3);
+        assert_eq!(test_polygons_vec.len(), 2);
+        assert_eq!(test_polygons_vec[0].0.len(), 3);
+        assert_eq!(test_polygons_vec[1].0.len(), 3);
 
         let test_ignore_flags_vec = image_ops::load_ignore_flags_vec_from_file(&filenames[11])?;
         assert_eq!(test_ignore_flags_vec.len(), 2);
@@ -1001,46 +1002,34 @@ mod tests {
         let polys_file_path = "test_polys_vec_file";
         let ign_flags_file_path = "test_ign_flags_vec_file";
 
-        let polys_test_vec = BatchPolygons(vec![
-            MultiplePolygons(vec![
-                // image 1
-                image_ops::Polygon {
-                    points: vec![
-                        Point::new(12, 21),
-                        Point::new(22, 21),
-                        Point::new(22, 11),
-                        Point::new(12, 11),
-                    ],
-                }, // poly 1
-                image_ops::Polygon {
-                    points: vec![
-                        Point::new(120, 210),
-                        Point::new(220, 210),
-                        Point::new(220, 110),
-                        Point::new(120, 110),
-                    ],
-                }, // poly 2
+        let polys_test_vec = vec![
+            // image 1
+            MultiPolygon::from(vec![
+                // poly 1
+                Polygon::new(
+                    LineString::from(vec![(12, 21), (22, 21), (22, 11), (12, 11)]),
+                    vec![],
+                ),
+                // poly 2
+                Polygon::new(
+                    LineString::from(vec![(120, 210), (220, 210), (220, 110), (120, 110)]),
+                    vec![],
+                ),
             ]),
-            MultiplePolygons(vec![
-                // image 2
-                image_ops::Polygon {
-                    points: vec![
-                        Point::new(34, 43),
-                        Point::new(44, 43),
-                        Point::new(44, 33),
-                        Point::new(34, 33),
-                    ],
-                }, // poly 3
-                image_ops::Polygon {
-                    points: vec![
-                        Point::new(34, 43),
-                        Point::new(44, 43),
-                        Point::new(44, 33),
-                        Point::new(34, 33),
-                    ],
-                }, // poly 4
+            // image 2
+            MultiPolygon::from(vec![
+                // poly 3
+                Polygon::new(
+                    LineString::from(vec![(34, 43), (44, 43), (44, 33), (34, 33)]),
+                    vec![],
+                ),
+                // poly 4
+                Polygon::new(
+                    LineString::from(vec![(34, 43), (44, 43), (44, 33), (34, 33)]),
+                    vec![],
+                ),
             ]),
-        ]);
+        ];
         assert_eq!(Path::new(polys_file_path).exists(), false);
         save_batch_polygons(&polys_test_vec, polys_file_path, true)?;
         assert_eq!(Path::new(polys_file_path).exists(), true);

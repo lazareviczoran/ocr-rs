@@ -9,7 +9,7 @@ use crate::utils::save_vs;
 use anyhow::{anyhow, Result};
 use itertools::izip;
 use log::{debug, info};
-use metrics::{gather_measure, get_boxes_and_box_scores, validate_measure};
+use metrics::{gather_measure, get_boxes_and_box_scores, validate_measure, PolygonScores};
 use model::resnet18;
 use options::TextDetOptions;
 use std::path::Path;
@@ -58,17 +58,14 @@ pub fn run_text_detection<T: AsRef<std::path::Path>>(
         Ok(image)
     })?;
     pred_image.save("pred.png")?;
-    let (_boxes, _scores) = measure_time!(
-        "found contours",
-        || -> Result<(image_ops::BatchPolygons, Vec<Vec<f64>>)> {
-            let res = get_boxes_and_box_scores(
-                &pred,
-                &Tensor::of_slice(&[adj_x, adj_y]).view((1, 2)),
-                true,
-            )?;
-            Ok(res)
-        }
-    )?;
+    let PolygonScores {
+        polygons: _boxes,
+        scores: _scores,
+    } = measure_time!("found contours", || -> Result<PolygonScores> {
+        let res =
+            get_boxes_and_box_scores(&pred, &Tensor::of_slice(&[adj_x, adj_y]).view((1, 2)), true)?;
+        Ok(res)
+    })?;
     Ok(())
 }
 
@@ -194,19 +191,19 @@ fn get_model_accuracy(
         for (images_chunk, adjs_chunk, polys_chunk, flags_chunk) in izip!(
             images.chunk(num_of_chunks, 0).iter(),
             adjs.chunk(num_of_chunks, 0).iter(),
-            polys.0.chunks(opts.chunk_size),
+            polys.chunks(opts.chunk_size),
             ignore_flags.chunks(opts.chunk_size)
         ) {
             debug!("starting validate_measure for chunk");
             let pred = measure_time!("accuracy calc -> inference", || net
                 .forward_t(&images_chunk, false));
-            let (boxes, scores) = measure_time!(
-                "box_scores_time",
-                || -> Result<(image_ops::BatchPolygons, Vec<Vec<f64>>)> {
-                    let res = get_boxes_and_box_scores(&pred, &adjs_chunk, is_output_polygon)?;
-                    Ok(res)
-                }
-            )?;
+            let PolygonScores {
+                polygons: boxes,
+                scores,
+            } = measure_time!("box_scores_time", || -> Result<PolygonScores> {
+                let res = get_boxes_and_box_scores(&pred, &adjs_chunk, is_output_polygon)?;
+                Ok(res)
+            })?;
             raw_metrics.push(measure_time!(
                 "validation",
                 || -> Result<Vec<metrics::MetricsItem>> {

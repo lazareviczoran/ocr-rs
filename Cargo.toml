@@ -25,7 +25,7 @@ image = "0.23.11"
 imageproc = { git = "https://github.com/image-rs/imageproc" }
 rayon = "1.5.0"
 clap = "2.33.3"
-geo = "0.15.0"
+geo = { version = "0.15.0", features = ["use-serde"] }
 geo-clipper = { git = "https://github.com/lazareviczoran/geo-clipper", branch = "zl-update-clipper-sys" }
 serde = { version = "1.0.117", features = ["derive"] }
 serde_json = "1.0.59"
