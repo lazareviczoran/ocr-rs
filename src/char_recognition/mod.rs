@@ -36,9 +36,10 @@ pub fn train_model(opts: &CharRecOptions) -> Result<Net> {
     Ok(net)
 }
 
-pub fn run_prediction(image_path: &str, model_file_path: &str) -> Result<()> {
-    if !Path::new(model_file_path).exists() {
-        return Err(anyhow!("Model file {} doesn't exist", model_file_path));
+pub fn run_prediction<T: AsRef<Path>>(image_path: T, model_file_path: T) -> Result<()> {
+    let path = model_file_path.as_ref();
+    if !path.exists() {
+        return Err(anyhow!("Model file {} doesn't exist", path.display()));
     }
     let mut weights = nn::VarStore::new(*DEVICE);
     let net = Net::new(&weights.root());

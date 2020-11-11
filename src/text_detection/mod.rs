@@ -20,9 +20,9 @@ const DEFAULT_TENSORS_DIR: &str = "./text_det_tensor_files";
 pub const DEFAULT_WIDTH: u32 = 800;
 pub const DEFAULT_HEIGHT: u32 = 800;
 
-pub fn run_text_detection(
-    image_path: &str,
-    model_file_path: &str,
+pub fn run_text_detection<T: AsRef<std::path::Path>>(
+    image_path: T,
+    model_file_path: T,
     dimensions: (u32, u32),
 ) -> Result<()> {
     let (preprocessed_image, adj_x, adj_y) = measure_time!(
@@ -33,8 +33,9 @@ pub fn run_text_detection(
         }
     )?;
     let mut vs = nn::VarStore::new(*DEVICE);
-    if !Path::new(model_file_path).exists() {
-        return Err(anyhow!("Model file doesn't exist"));
+    let path = model_file_path.as_ref();
+    if !path.exists() {
+        return Err(anyhow!("Model file {} doesn't exist", path.display()));
     }
     let net = resnet18(&vs.root());
     measure_time!("loading model", || -> Result<()> {
@@ -99,7 +100,7 @@ pub fn train_model(opts: &TextDetOptions) -> Result<FuncT<'static>> {
         opts.image_dimensions.0 as i64,
         opts.image_dimensions.1 as i64,
     );
-    let target_chunk_size = 4;
+    let target_chunk_size = 2;
     for epoch in 1..=epoch_limit {
         measure_time!("training single batch", || -> Result<()> {
             for (i, images_batch) in dataset_paths.train_images.iter().enumerate() {

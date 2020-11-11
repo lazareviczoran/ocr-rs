@@ -1,7 +1,6 @@
 use super::dataset::TextDetectionDataset;
 use super::measure_time;
-use super::utils::{VALUES_COUNT, VALUES_MAP};
-use crate::utils::save_tensor;
+use super::utils::{save_tensor, VALUES_COUNT, VALUES_MAP};
 use anyhow::{anyhow, Result};
 use image::{imageops::FilterType, open, DynamicImage, GrayImage, ImageBuffer, Luma};
 use imageproc::definitions::{HasBlack, HasWhite, Point};
@@ -44,19 +43,15 @@ lazy_static! {
     static ref TEXT_DET_FILE_NAME_FORMAT_REGEX: Regex = Regex::new(r"img[0-9]+\.jpg").unwrap();
 }
 
-pub fn load_values(target_dir: &str) -> Result<Dataset> {
+pub fn load_values<T: AsRef<Path>>(target_dir: T) -> Result<Dataset> {
     trace!("loading character recognition values");
     let (train_images, train_labels, test_images, test_labels) = measure_time!(
         "loading values",
         || -> Result<(Tensor, Tensor, Tensor, Tensor)> {
-            let train_images =
-                Tensor::load(&format!("{}/{}", target_dir, CHAR_REC_TRAIN_IMAGES_FILE))?;
-            let train_labels =
-                Tensor::load(&format!("{}/{}", target_dir, CHAR_REC_TRAIN_LABELS_FILE))?;
-            let test_images =
-                Tensor::load(&format!("{}/{}", target_dir, CHAR_REC_TEST_IMAGES_FILE))?;
-            let test_labels =
-                Tensor::load(&format!("{}/{}", target_dir, CHAR_REC_TEST_LABELS_FILE))?;
+            let train_images = Tensor::load(target_dir.as_ref().join(CHAR_REC_TRAIN_IMAGES_FILE))?;
+            let train_labels = Tensor::load(target_dir.as_ref().join(CHAR_REC_TRAIN_LABELS_FILE))?;
+            let test_images = Tensor::load(target_dir.as_ref().join(CHAR_REC_TEST_IMAGES_FILE))?;
+            let test_labels = Tensor::load(target_dir.as_ref().join(CHAR_REC_TEST_LABELS_FILE))?;
             Ok((train_images, train_labels, test_images, test_labels))
         },
         LogType::Debug
@@ -71,9 +66,10 @@ pub fn load_values(target_dir: &str) -> Result<Dataset> {
     })
 }
 
-pub fn load_image_as_tensor(file_path: &str) -> Result<Tensor> {
-    if !Path::new(file_path).exists() {
-        return Err(anyhow!("File {} doesn't exist", file_path));
+pub fn load_image_as_tensor<T: AsRef<Path>>(file_path: T) -> Result<Tensor> {
+    let path = file_path.as_ref();
+    if !path.exists() {
+        return Err(anyhow!("File {} doesn't exist", path.display()));
     }
     let image = open(file_path)?.into_luma();
     let dim = image.width() * image.height();
@@ -84,34 +80,37 @@ pub fn load_image_as_tensor(file_path: &str) -> Result<Tensor> {
     Ok(images_tensor)
 }
 
-pub fn generate_char_rec_tensor_files(images_dir: &str, target_dir: &str) -> Result<()> {
-    let training_images_data = load_images(&format!("{}/train", images_dir))?;
+pub fn generate_char_rec_tensor_files<T: AsRef<Path>>(images_dir: T, target_dir: T) -> Result<()> {
+    let train_images_dir = images_dir.as_ref().join("train");
+    let test_images_dir = images_dir.as_ref().join("test");
+    let training_images_data = load_images(&train_images_dir)?;
     save_tensor(
         &training_images_data,
-        &format!("{}/{}", target_dir, CHAR_REC_TRAIN_IMAGES_FILE),
+        target_dir.as_ref().join(CHAR_REC_TRAIN_IMAGES_FILE),
     )?;
-    let training_labels_data = load_labels(&format!("{}/train", images_dir))?;
+    let training_labels_data = load_labels(train_images_dir)?;
     save_tensor(
         &training_labels_data,
-        &format!("{}/{}", target_dir, CHAR_REC_TRAIN_LABELS_FILE),
+        target_dir.as_ref().join(CHAR_REC_TRAIN_LABELS_FILE),
     )?;
-    let test_images_data = load_images(&format!("{}/test", images_dir))?;
+    let test_images_data = load_images(&test_images_dir)?;
     save_tensor(
         &test_images_data,
-        &format!("{}/{}", target_dir, CHAR_REC_TEST_IMAGES_FILE),
+        target_dir.as_ref().join(CHAR_REC_TEST_IMAGES_FILE),
     )?;
-    let test_labels_data = load_labels(&format!("{}/test", images_dir))?;
+    let test_labels_data = load_labels(test_images_dir)?;
     save_tensor(
         &test_labels_data,
-        &format!("{}/{}", target_dir, CHAR_REC_TEST_LABELS_FILE),
+        target_dir.as_ref().join(CHAR_REC_TEST_LABELS_FILE),
     )?;
     info!("Successfully generated tensor files!");
 
     Ok(())
 }
 
-fn load_images(dir_path: &str) -> Result<Tensor> {
-    if let Ok(files) = fs::read_dir(dir_path) {
+fn load_images<T: AsRef<Path>>(dir_path: T) -> Result<Tensor> {
+    let dir = dir_path.as_ref();
+    if let Ok(files) = fs::read_dir(dir) {
         let mut files_info: Vec<std::fs::DirEntry> = files.map(|f| f.unwrap()).collect();
         files_info.sort_by_key(|a| a.file_name());
         let images_tensor = files_info
@@ -152,11 +151,12 @@ fn load_images(dir_path: &str) -> Result<Tensor> {
             );
         return Ok(images_tensor.to_kind(Kind::Float) / 255.);
     }
-    Err(anyhow!("Could not open dir {}", dir_path))
+    Err(anyhow!("Could not open dir {}", dir.display()))
 }
 
-fn load_labels(dir_path: &str) -> Result<Tensor> {
-    if let Ok(files) = fs::read_dir(dir_path) {
+fn load_labels<T: AsRef<Path>>(dir_path: T) -> Result<Tensor> {
+    let dir = dir_path.as_ref();
+    if let Ok(files) = fs::read_dir(dir) {
         let mut filenames: Vec<String> = files
             .map(|f| f.unwrap().file_name().into_string().unwrap())
             .collect();
@@ -177,13 +177,16 @@ fn load_labels(dir_path: &str) -> Result<Tensor> {
             });
         Ok(Tensor::of_slice(&labels).to_kind(Kind::Int64))
     } else {
-        Err(anyhow!("Could not open dir {}", dir_path))
+        Err(anyhow!("Could not open dir {}", dir.display()))
     }
 }
 
-pub fn preprocess_image(file_path: &str, target_dim: (u32, u32)) -> Result<(GrayImage, f64, f64)> {
+pub fn preprocess_image<T: AsRef<Path>>(
+    file_path: T,
+    target_dim: (u32, u32),
+) -> Result<(GrayImage, f64, f64)> {
     let (width, height) = target_dim;
-    let rgba_image = open(file_path)?.into_rgba();
+    let rgba_image = open(file_path.as_ref())?.into_rgba();
     let original_width = rgba_image.width();
     let original_height = rgba_image.height();
     let dyn_image = DynamicImage::ImageRgba8(rgba_image)
@@ -261,12 +264,11 @@ fn generate_gt_and_mask_images(
     Ok((gt_image, mask_image, ignore_flags))
 }
 
-fn load_polygons(file_path: &str) -> Result<MultiplePolygons> {
-    let polygons;
-    if let Ok(mut file) = File::open(file_path) {
+fn load_polygons<T: AsRef<Path>>(file_path: T) -> Result<MultiplePolygons> {
+    if let Ok(mut file) = File::open(file_path.as_ref()) {
         let mut content = String::new();
         file.read_to_string(&mut content)?;
-        polygons = content
+        let polygons = content
             .split_terminator('\n')
             .collect::<Vec<&str>>()
             .par_iter()
@@ -288,28 +290,27 @@ fn load_polygons(file_path: &str) -> Result<MultiplePolygons> {
                 }
             })
             .collect();
+        Ok(MultiplePolygons(polygons))
     } else {
-        return Err(anyhow!("didn't find file {}", file_path));
+        Err(anyhow!("didn't find file {}", file_path.as_ref().display()))
     }
-
-    Ok(MultiplePolygons(polygons))
 }
 
-pub fn load_text_detection_image(
-    images_base_dir: &str,
-    file_path: &str,
+pub fn load_text_detection_image<T: AsRef<Path>, H: AsRef<Path>>(
+    images_base_dir: T,
+    file_path: H,
     target_dim: (u32, u32),
 ) -> Result<(Tensor, Tensor, Tensor, Tensor, MultiplePolygons, Vec<bool>)> {
-    let (preprocessed_image, adjust_x, adjust_y) = preprocess_image(file_path, target_dim)?;
+    let path = file_path.as_ref();
+    let (preprocessed_image, adjust_x, adjust_y) = preprocess_image(path, target_dim)?;
 
-    let path_parts = file_path.split_terminator('/').collect::<Vec<&str>>();
-    let last_idx = path_parts.len() - 1;
-    let polygons = load_polygons(&format!(
-        "{}/gts/{}/{}.txt",
-        images_base_dir,
-        path_parts[last_idx - 1],
-        path_parts[last_idx]
-    ))?;
+    let extension = path.extension().unwrap().to_str().unwrap();
+    let polygons = load_polygons(
+        images_base_dir.as_ref().join("gts").join(
+            path.strip_prefix(images_base_dir.as_ref().join("images"))?
+                .with_extension(format!("{}.txt", extension)),
+        ),
+    )?;
 
     let (gt_image, mask_image, ignore_flags) =
         generate_gt_and_mask_images(&polygons, adjust_x, adjust_y, target_dim)?;
@@ -363,7 +364,9 @@ pub fn convert_tensor_to_image(tensor: &Tensor) -> Result<GrayImage> {
     Ok(ImageBuffer::from_vec(w, h, pixel_values).unwrap())
 }
 
-pub fn load_text_detection_tensor_files(target_dir: &str) -> Result<TextDetectionDataset> {
+pub fn load_text_detection_tensor_files<T: AsRef<Path>>(
+    target_dir: T,
+) -> Result<TextDetectionDataset> {
     if let Ok(files) = fs::read_dir(&target_dir) {
         let mut train_images = BTreeSet::new();
         let mut train_gt = BTreeSet::new();
@@ -448,7 +451,10 @@ pub fn load_text_detection_tensor_files(target_dir: &str) -> Result<TextDetectio
             test_ignore_flags: test_ignore_flags.into_iter().collect(),
         })
     } else {
-        Err(anyhow!("The directory doesn't exist"))
+        Err(anyhow!(
+            "The directory {} doesn't exist",
+            target_dir.as_ref().display()
+        ))
     }
 }
 
@@ -491,38 +497,35 @@ pub struct BatchPolygons(pub Vec<MultiplePolygons>);
 
 #[derive(Debug)]
 pub struct TextDetDataBatch {
-    images_tensor: Tensor,
-    gts_tensor: Tensor,
-    masks_tensor: Tensor,
-    adjs_tensor: Tensor,
+    images: Tensor,
+    gts: Tensor,
+    masks: Tensor,
+    adjs_values: Tensor,
     polygons: Vec<MultiplePolygons>,
     ignore_flags: Vec<Vec<bool>>,
 }
 impl TextDetDataBatch {
     pub fn new() -> Self {
         Self {
-            images_tensor: Tensor::of_slice(&[0]),
-            gts_tensor: Tensor::of_slice(&[0]),
-            masks_tensor: Tensor::of_slice(&[0]),
-            adjs_tensor: Tensor::of_slice(&[0]),
+            images: Tensor::of_slice(&[0]),
+            gts: Tensor::of_slice(&[0]),
+            masks: Tensor::of_slice(&[0]),
+            adjs_values: Tensor::of_slice(&[0]),
             polygons: Vec::new(),
             ignore_flags: Vec::new(),
         }
     }
 }
 
-pub fn generate_text_det_tensor_chunks(
-    images_base_dir: &str,
-    target_dir: &str,
+pub fn generate_text_det_tensor_chunks<T: AsRef<Path>>(
+    images_base_dir: T,
+    target_dir: T,
     train: bool,
     dim: (u32, u32),
 ) -> Result<()> {
-    let window_size = if train { 40 } else { 10 };
-    let images_dir = format!(
-        "{}/images/{}",
-        images_base_dir,
-        if train { "train" } else { "test" }
-    );
+    let (window_size, data_type) = if train { (40, "train") } else { (10, "test") };
+    let base_dir = images_base_dir.as_ref();
+    let images_dir = base_dir.join("images").join(data_type);
 
     if let Ok(files) = fs::read_dir(&images_dir) {
         let mut files_info: Vec<std::fs::DirEntry> = files.map(|f| f.unwrap()).collect();
@@ -540,27 +543,21 @@ pub fn generate_text_det_tensor_chunks(
                             .captures(&filename)
                             .is_some()
                         {
-                            match load_text_detection_image(
-                                images_base_dir,
-                                &file.path().display().to_string(),
-                                dim,
-                            ) {
+                            match load_text_detection_image(base_dir, file.path(), dim) {
                                 Ok((im, gt, mask, adj_values, polygons, ignore_flags)) => {
                                     acc.polygons.push(polygons);
                                     acc.ignore_flags.push(ignore_flags);
-                                    if acc.images_tensor.numel() == 1 {
-                                        acc.images_tensor = im;
-                                        acc.gts_tensor = gt;
-                                        acc.masks_tensor = mask;
-                                        acc.adjs_tensor = adj_values;
+                                    if acc.images.numel() == 1 {
+                                        acc.images = im;
+                                        acc.gts = gt;
+                                        acc.masks = mask;
+                                        acc.adjs_values = adj_values;
                                     } else {
-                                        acc.images_tensor =
-                                            Tensor::cat(&[acc.images_tensor, im], 0);
-                                        acc.gts_tensor = Tensor::cat(&[acc.gts_tensor, gt], 0);
-                                        acc.masks_tensor =
-                                            Tensor::cat(&[acc.masks_tensor, mask], 0);
-                                        acc.adjs_tensor =
-                                            Tensor::cat(&[acc.adjs_tensor, adj_values], 0);
+                                        acc.images = Tensor::cat(&[acc.images, im], 0);
+                                        acc.gts = Tensor::cat(&[acc.gts, gt], 0);
+                                        acc.masks = Tensor::cat(&[acc.masks, mask], 0);
+                                        acc.adjs_values =
+                                            Tensor::cat(&[acc.adjs_values, adj_values], 0);
                                     }
                                 }
                                 Err(msg) => {
@@ -571,23 +568,21 @@ pub fn generate_text_det_tensor_chunks(
                         acc
                     })
                     .reduce(TextDetDataBatch::new, |mut acc, mut partial| {
-                        if acc.images_tensor.numel() == 1 {
+                        if acc.images.numel() == 1 {
                             acc = partial;
-                        } else if partial.images_tensor.numel() != 1 {
+                        } else if partial.images.numel() != 1 {
                             acc.polygons.append(&mut partial.polygons);
                             acc.ignore_flags.append(&mut partial.ignore_flags);
-                            acc.images_tensor =
-                                Tensor::cat(&[acc.images_tensor, partial.images_tensor], 0);
-                            acc.gts_tensor = Tensor::cat(&[acc.gts_tensor, partial.gts_tensor], 0);
-                            acc.masks_tensor =
-                                Tensor::cat(&[acc.masks_tensor, partial.masks_tensor], 0);
-                            acc.adjs_tensor =
-                                Tensor::cat(&[acc.adjs_tensor, partial.adjs_tensor], 0);
+                            acc.images = Tensor::cat(&[acc.images, partial.images], 0);
+                            acc.gts = Tensor::cat(&[acc.gts, partial.gts], 0);
+                            acc.masks = Tensor::cat(&[acc.masks, partial.masks], 0);
+                            acc.adjs_values =
+                                Tensor::cat(&[acc.adjs_values, partial.adjs_values], 0);
                         }
                         acc
                     });
 
-                save_batch(batch_data, target_dir, pos, train);
+                save_batch(batch_data, target_dir.as_ref(), pos, train);
             });
         info!(
             "Successfully generated {} tensor files!",
@@ -597,7 +592,7 @@ pub fn generate_text_det_tensor_chunks(
     } else {
         Err(anyhow!(
             "didn't find text detection images dir: {}",
-            images_dir
+            images_dir.display()
         ))
     }
 }
@@ -614,7 +609,13 @@ fn get_target_filename(name: &str) -> String {
     String::from(name)
 }
 
-pub fn save_batch(batch: TextDetDataBatch, target_dir: &str, idx: usize, is_train: bool) {
+pub fn save_batch<T: AsRef<Path>>(
+    batch: TextDetDataBatch,
+    target_dir_path: T,
+    idx: usize,
+    is_train: bool,
+) {
+    let target_dir = target_dir_path.as_ref();
     let images_file;
     let gt_file;
     let mask_file;
@@ -637,85 +638,94 @@ pub fn save_batch(batch: TextDetDataBatch, target_dir: &str, idx: usize, is_trai
         ignore_flags_file = get_target_filename(TEXT_DET_TEST_IGNORE_FLAGS_FILE);
     };
     if let Err(msg) = save_tensor(
-        &batch.images_tensor,
-        &format!("{}/{}.{}", target_dir, images_file, idx),
+        &batch.images,
+        target_dir.join(format!("{}{}", images_file, idx)),
     ) {
         error!("Error while saving image tensor {}", msg);
     }
-    if let Err(msg) = save_tensor(
-        &batch.gts_tensor,
-        &format!("{}/{}.{}", target_dir, gt_file, idx),
-    ) {
+    if let Err(msg) = save_tensor(&batch.gts, target_dir.join(format!("{}{}", gt_file, idx))) {
         error!("Error while saving gt tensor {}", msg);
     }
     if let Err(msg) = save_tensor(
-        &batch.masks_tensor,
-        &format!("{}/{}.{}", target_dir, mask_file, idx),
+        &batch.masks,
+        target_dir.join(format!("{}{}", mask_file, idx)),
     ) {
         error!("Error while saving mask tensor {}", msg);
     }
     if let Err(msg) = save_tensor(
-        &batch.adjs_tensor,
-        &format!("{}/{}.{}", target_dir, adj_file, idx),
+        &batch.adjs_values,
+        target_dir.join(format!("{}{}", adj_file, idx)),
     ) {
         error!("Error while saving adj tensor {}", msg);
     }
     if let Err(msg) = save_batch_polygons(
         &BatchPolygons(batch.polygons),
-        &format!("{}/{}.{}", target_dir, polys_file, idx),
+        target_dir.join(format!("{}{}", polys_file, idx)),
         true,
     ) {
         error!("Error while saving polygons vec {}", msg);
     }
     if let Err(msg) = save_vec_to_file(
         &batch.ignore_flags,
-        &format!("{}/{}.{}", target_dir, ignore_flags_file, idx),
+        target_dir.join(format!("{}{}", ignore_flags_file, idx)),
         true,
     ) {
         error!("Error while saving ignore flags vec {}", msg);
     }
 }
 
-fn save_vec_to_file<T: Serialize>(value: &[T], file_path: &str, overwrite: bool) -> Result<()> {
-    if Path::new(file_path).exists() {
+fn save_vec_to_file<T: Serialize, H: AsRef<Path>>(
+    value: &[T],
+    file_path: H,
+    overwrite: bool,
+) -> Result<()> {
+    let path = file_path.as_ref();
+    if path.exists() {
         if overwrite {
-            fs::remove_file(file_path)?;
+            fs::remove_file(path)?;
         } else {
-            return Err(anyhow!("file {} already exists", file_path));
+            return Err(anyhow!("file {} already exists", path.display()));
         }
     }
-    serde_json::to_writer(File::create(file_path)?, value)?;
+    serde_json::to_writer(File::create(path)?, value)?;
 
     Ok(())
 }
 
-fn save_batch_polygons(polygons: &BatchPolygons, file_path: &str, overwrite: bool) -> Result<()> {
-    if Path::new(file_path).exists() {
+fn save_batch_polygons<T: AsRef<Path>>(
+    polygons: &BatchPolygons,
+    file_path: T,
+    overwrite: bool,
+) -> Result<()> {
+    let path = file_path.as_ref();
+    if path.exists() {
         if overwrite {
-            fs::remove_file(file_path)?;
+            fs::remove_file(path)?;
         } else {
-            return Err(anyhow!("file {} already exists", file_path));
+            return Err(anyhow!("file {} already exists", path.display()));
         }
     }
-    serde_json::to_writer(File::create(file_path)?, polygons)?;
+    serde_json::to_writer(File::create(path)?, polygons)?;
 
     Ok(())
 }
 
-pub fn load_polygons_vec_from_file(file_path: &str) -> Result<BatchPolygons> {
-    if !Path::new(file_path).exists() {
-        return Err(anyhow!("file {} doesn't exists", file_path));
+pub fn load_polygons_vec_from_file<T: AsRef<Path>>(file_path: T) -> Result<BatchPolygons> {
+    let path = file_path.as_ref();
+    if !path.exists() {
+        return Err(anyhow!("file {} doesn't exists", path.display()));
     }
-    let reader = BufReader::new(File::open(file_path)?);
+    let reader = BufReader::new(File::open(path)?);
     let value = serde_json::from_reader(reader)?;
     Ok(value)
 }
 
-pub fn load_ignore_flags_vec_from_file(file_path: &str) -> Result<Vec<Vec<bool>>> {
-    if !Path::new(file_path).exists() {
-        return Err(anyhow!("file {} doesn't exists", file_path));
+pub fn load_ignore_flags_vec_from_file<T: AsRef<Path>>(file_path: T) -> Result<Vec<Vec<bool>>> {
+    let path = file_path.as_ref();
+    if !path.exists() {
+        return Err(anyhow!("file {} doesn't exists", path.display()));
     }
-    let file = File::open(file_path)?;
+    let file = File::open(path)?;
     let reader = BufReader::new(file);
     let value = serde_json::from_reader(reader)?;
     Ok(value)
@@ -817,9 +827,9 @@ mod tests {
             TEXT_DET_TEST_IGNORE_FLAGS_FILE,
         ]
         .iter()
-        .map(|&x| {
+        .map(|x| {
             let mut s = get_target_filename(x);
-            s.push_str(".0");
+            s.push('0');
             s
         })
         .collect();

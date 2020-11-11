@@ -1,7 +1,7 @@
 use anyhow::{anyhow, Result};
 use std::collections::HashMap;
 use std::fs::create_dir_all;
-use std::path::{Path, MAIN_SEPARATOR};
+use std::path::Path;
 use tch::{nn::VarStore, Tensor};
 
 pub const VALUES: &str = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
@@ -42,23 +42,21 @@ pub fn topk(tensor: &Tensor, k: i64) -> Vec<(char, f64)> {
         .collect()
 }
 
-pub fn save_tensor(tensor: &Tensor, path: &str) -> Result<()> {
-    if let Some(pos) = path.rfind(MAIN_SEPARATOR) {
-        let (dir, _) = path.split_at(pos);
-        if !Path::new(dir).exists() {
-            create_dir_all(dir)?;
-        }
+pub fn save_tensor<T: AsRef<Path>>(tensor: &Tensor, target_path: T) -> Result<()> {
+    let path = target_path.as_ref();
+    let dir = path.ancestors().nth(1).unwrap_or_else(|| Path::new("."));
+    if !dir.exists() {
+        create_dir_all(dir)?;
     }
     tensor.save(path)?;
     Ok(())
 }
 
-pub fn save_vs(vs: &VarStore, path: &str) -> Result<()> {
-    if let Some(pos) = path.rfind(MAIN_SEPARATOR) {
-        let (dir, _) = path.split_at(pos);
-        if !Path::new(dir).exists() {
-            create_dir_all(dir)?;
-        }
+pub fn save_vs<T: AsRef<Path>>(vs: &VarStore, target_path: T) -> Result<()> {
+    let path = target_path.as_ref();
+    let dir = path.ancestors().nth(1).unwrap_or_else(|| Path::new("."));
+    if !dir.exists() {
+        create_dir_all(dir)?;
     }
     vs.save(path)?;
     Ok(())
