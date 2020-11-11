@@ -83,6 +83,7 @@ fn main() -> Result<()> {
                             --weight-decay [WD]         'Specify the SGD weight decay'
                             --no-nesterov               'Do not use Nesterov momentum'
                             -d, --dimensions [DIM]      'The target dimensions of preprocessed image (e.g. 800x800)'
+                            --chunk-size [SIZE]         'The size of chunk to be processed in single train iteration (default is 2, in order to fit Docker's default memory limit)'
                             --test-interval [INT]       'Specify the the number of iterations after which the accuracy test will run'"
                         )
                 )

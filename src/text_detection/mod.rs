@@ -100,7 +100,6 @@ pub fn train_model(opts: &TextDetOptions) -> Result<FuncT<'static>> {
         opts.image_dimensions.0 as i64,
         opts.image_dimensions.1 as i64,
     );
-    let target_chunk_size = 2;
     for epoch in 1..=epoch_limit {
         measure_time!("training single batch", || -> Result<()> {
             for (i, images_batch) in dataset_paths.train_images.iter().enumerate() {
@@ -108,8 +107,7 @@ pub fn train_model(opts: &TextDetOptions) -> Result<FuncT<'static>> {
                 let image = Tensor::load(&images_batch)?
                     .view((-1, 1, h, w))
                     .to_kind(Kind::Float);
-                let num_of_chunks =
-                    (image.size()[0] as f32 / target_chunk_size as f32).ceil() as i64;
+                let num_of_chunks = (image.size()[0] as f32 / opts.chunk_size as f32).ceil() as i64;
                 let gt = Tensor::load(&dataset_paths.train_gt[i])?;
                 let mask = Tensor::load(&dataset_paths.train_mask[i])?;
                 for (images_chunk, gt_chunk, mask_chunk) in izip!(
@@ -132,8 +130,7 @@ pub fn train_model(opts: &TextDetOptions) -> Result<FuncT<'static>> {
         if epoch % opts.test_interval == 0 || epoch == epoch_limit {
             let (precision, _recall, _hmean) =
                 measure_time!("test process", || -> Result<(f64, f64, f64)> {
-                    let res =
-                        get_model_accuracy(&dataset_paths, &net, true, opts.image_dimensions)?;
+                    let res = get_model_accuracy(&dataset_paths, &net, true, opts)?;
                     Ok(res)
                 })?;
             info!("epoch: {:4} test acc: {:5.2}%", epoch, 100. * precision);
@@ -177,17 +174,19 @@ fn get_model_accuracy(
     dataset_paths: &TextDetectionDataset,
     net: &FuncT<'static>,
     is_output_polygon: bool,
-    dimensions: (u32, u32),
+    opts: &TextDetOptions,
 ) -> Result<(f64, f64, f64)> {
     let mut raw_metrics = Vec::new();
-    let (w, h) = (dimensions.0 as i64, dimensions.1 as i64);
-    let target_chunk = 4;
+    let (w, h) = (
+        opts.image_dimensions.0 as i64,
+        opts.image_dimensions.1 as i64,
+    );
     for i in 0..dataset_paths.test_images.len() {
         debug!("Calculating accuracy for batch {}", i);
         let images = Tensor::load(&dataset_paths.test_images[i])?
             .view((-1, 1, h, w))
             .to_kind(Kind::Float);
-        let num_of_chunks = (images.size()[0] as f32 / target_chunk as f32).ceil() as i64;
+        let num_of_chunks = (images.size()[0] as f32 / opts.chunk_size as f32).ceil() as i64;
         let adjs = Tensor::load(&dataset_paths.test_adj[i])?;
         let polys = image_ops::load_polygons_vec_from_file(&dataset_paths.test_polys[i])?;
         let ignore_flags =
@@ -195,8 +194,8 @@ fn get_model_accuracy(
         for (images_chunk, adjs_chunk, polys_chunk, flags_chunk) in izip!(
             images.chunk(num_of_chunks, 0).iter(),
             adjs.chunk(num_of_chunks, 0).iter(),
-            polys.0.chunks(target_chunk),
-            ignore_flags.chunks(target_chunk)
+            polys.0.chunks(opts.chunk_size),
+            ignore_flags.chunks(opts.chunk_size)
         ) {
             debug!("starting validate_measure for chunk");
             let pred = measure_time!("accuracy calc -> inference", || net
