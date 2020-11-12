@@ -62,8 +62,7 @@ pub fn run_text_detection<T: AsRef<std::path::Path>>(
         polygons: _boxes,
         scores: _scores,
     } = measure_time!("found contours", || -> Result<PolygonScores> {
-        let res =
-            get_boxes_and_box_scores(&pred, &Tensor::of_slice(&[adj_x, adj_y]).view((1, 2)), true)?;
+        let res = get_boxes_and_box_scores(&pred, &Tensor::of_slice(&[adj_x, adj_y]).view((1, 2)))?;
         Ok(res)
     })?;
     Ok(())
@@ -127,7 +126,7 @@ pub fn train_model(opts: &TextDetOptions) -> Result<FuncT<'static>> {
         if epoch % opts.test_interval == 0 || epoch == epoch_limit {
             let (precision, _recall, _hmean) =
                 measure_time!("test process", || -> Result<(f64, f64, f64)> {
-                    let res = get_model_accuracy(&dataset_paths, &net, true, opts)?;
+                    let res = get_model_accuracy(&dataset_paths, &net, opts)?;
                     Ok(res)
                 })?;
             info!("epoch: {:4} test acc: {:5.2}%", epoch, 100. * precision);
@@ -170,7 +169,6 @@ fn calculate_balance_loss(pred: &Tensor, gt: &Tensor, mask: &Tensor) -> Tensor {
 fn get_model_accuracy(
     dataset_paths: &TextDetectionDataset,
     net: &FuncT<'static>,
-    is_output_polygon: bool,
     opts: &TextDetOptions,
 ) -> Result<(f64, f64, f64)> {
     let mut raw_metrics = Vec::new();
@@ -201,13 +199,13 @@ fn get_model_accuracy(
                 polygons: boxes,
                 scores,
             } = measure_time!("box_scores_time", || -> Result<PolygonScores> {
-                let res = get_boxes_and_box_scores(&pred, &adjs_chunk, is_output_polygon)?;
+                let res = get_boxes_and_box_scores(&pred, &adjs_chunk)?;
                 Ok(res)
             })?;
             raw_metrics.push(measure_time!(
                 "validation",
                 || -> Result<Vec<metrics::MetricsItem>> {
-                    let res = validate_measure(&polys_chunk, &flags_chunk, &boxes, &scores, true)?;
+                    let res = validate_measure(&polys_chunk, &flags_chunk, &boxes, &scores)?;
                     Ok(res)
                 }
             )?);

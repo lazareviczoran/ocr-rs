@@ -1,12 +1,14 @@
 use super::dataset::TextDetectionDataset;
 use super::measure_time;
+use super::polygon::shrink_polygon;
 use super::utils::{save_tensor, VALUES_COUNT, VALUES_MAP};
 use anyhow::{anyhow, Result};
-use geo::{LineString, MultiPolygon, Polygon};
+use geo::{CoordinateType, LineString, MultiPolygon, Polygon};
 use image::{imageops::FilterType, open, DynamicImage, GrayImage, ImageBuffer, Luma};
 use imageproc::definitions::{HasBlack, HasWhite, Point};
 use imageproc::drawing::draw_polygon_mut;
 use log::{error, info, trace};
+use num_traits::{Num, NumCast};
 use rayon::prelude::*;
 use regex::Regex;
 use serde::Serialize;
@@ -225,6 +227,7 @@ fn generate_gt_and_mask_images(
     let (width, height) = target_dim;
     let mut gt_image = GrayImage::new(width, height);
     let mut mask_temp = DynamicImage::new_luma8(width, height);
+    let shrink_ratio: f64 = 0.5;
     mask_temp.invert();
     let mut mask_image = mask_temp.to_luma();
     let mut ignore_flags = vec![false; polygons.0.len()];
@@ -233,7 +236,7 @@ fn generate_gt_and_mask_images(
         let (min_x, max_x, min_y, max_y) =
             ext_poly
                 .points_iter()
-                .fold((std::u32::MAX, 0, std::u32::MAX, 0), |acc, p| {
+                .fold((u32::MAX, 0, u32::MAX, 0), |acc, p| {
                     (
                         acc.0.min(p.x()),
                         acc.1.max(p.x()),
@@ -260,8 +263,14 @@ fn generate_gt_and_mask_images(
         if poly_height.min(poly_width) < MIN_TEXT_SIZE {
             draw_polygon_mut(&mut mask_image, &poly_values, Luma::black());
             ignore_flags[pos] = true;
-        } else {
-            draw_polygon_mut(&mut gt_image, &poly_values, Luma::white());
+            continue;
+        }
+        match shrink_polygon(&poly_values, 1. - shrink_ratio.powi(2)) {
+            Some(shrinked_poly) => draw_polygon_mut(&mut gt_image, &shrinked_poly, Luma::white()),
+            None => {
+                draw_polygon_mut(&mut mask_image, &poly_values, Luma::black());
+                ignore_flags[pos] = true;
+            }
         }
     }
     Ok((gt_image, mask_image, ignore_flags))
@@ -693,8 +702,8 @@ fn save_vec_to_file<T: Serialize, H: AsRef<Path>>(
     Ok(())
 }
 
-fn save_batch_polygons<T: AsRef<Path>>(
-    polygons: &[MultiPolygon<u32>],
+fn save_batch_polygons<T: AsRef<Path>, V: Num + NumCast + Serialize + CoordinateType>(
+    polygons: &[MultiPolygon<V>],
     file_path: T,
     overwrite: bool,
 ) -> Result<()> {
@@ -801,14 +810,14 @@ mod tests {
         // load expected images
         let train_img1 = open("test_data/preprocessed_img224.png")?.to_luma();
         let train_img2 = open("test_data/preprocessed_img55.png")?.to_luma();
-        let train_gt_img1 = open("test_data/gt_img224.png")?.to_luma();
-        let train_gt_img2 = open("test_data/gt_img55.png")?.to_luma();
+        let train_gt_img1 = open("test_data/gt_shrinked_img224.png")?.to_luma();
+        let train_gt_img2 = open("test_data/gt_shrinked_img55.png")?.to_luma();
         let train_mask_img1 = open("test_data/mask_img224.png")?.to_luma();
         let train_mask_img2 = open("test_data/mask_img55.png")?.to_luma();
         let test_img1 = open("test_data/preprocessed_img494.png")?.to_luma();
         let test_img2 = open("test_data/preprocessed_img545.png")?.to_luma();
-        let test_gt_img1 = open("test_data/gt_img494.png")?.to_luma();
-        let test_gt_img2 = open("test_data/gt_img545.png")?.to_luma();
+        let test_gt_img1 = open("test_data/gt_shrinked_img494.png")?.to_luma();
+        let test_gt_img2 = open("test_data/gt_shrinked_img545.png")?.to_luma();
         let test_mask_img1 = open("test_data/mask_img494.png")?.to_luma();
         let test_mask_img2 = open("test_data/mask_img545.png")?.to_luma();
 

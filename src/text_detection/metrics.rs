@@ -1,14 +1,15 @@
 use crate::image_ops;
+use crate::polygon::expand_polygon;
 use anyhow::Result;
 use geo::prelude::*;
-use geo::{Coordinate, LineString, MultiPolygon, Polygon};
+use geo::{LineString, MultiPolygon, Polygon};
 use geo_clipper::Clipper;
 use image::{GrayImage, Luma};
 use imageproc::contours::{approx_poly_dp, arc_length, find_contours, get_distance, min_area_rect};
 use imageproc::definitions::{HasWhite, Point};
 use imageproc::drawing::{self};
 use itertools::izip;
-use num_traits::clamp;
+use num_traits::{clamp, Num, NumCast};
 use std::sync::Mutex;
 use tch::{Kind, Tensor};
 
@@ -31,30 +32,18 @@ pub struct PolygonScores {
     pub scores: Vec<Vec<f64>>,
 }
 
-pub fn get_boxes_and_box_scores(
-    pred: &Tensor,
-    adjust_values: &Tensor,
-    is_output_polygon: bool,
-) -> Result<PolygonScores> {
+pub fn get_boxes_and_box_scores(pred: &Tensor, adjust_values: &Tensor) -> Result<PolygonScores> {
     let thresh = 0.6;
     let mut boxes_batch = Vec::new();
     let mut scores_batch = Vec::new();
     let segmentation = binarize(&pred, thresh)?;
 
     for batch_index in 0..pred.size()[0] {
-        let (boxes, scores) = if is_output_polygon {
-            get_polygons_from_bitmap(
-                &pred.get(batch_index),
-                &segmentation.get(batch_index),
-                &adjust_values.get(batch_index),
-            )?
-        } else {
-            get_boxes_from_bitmap(
-                &pred.get(batch_index),
-                &segmentation.get(batch_index),
-                &adjust_values.get(batch_index),
-            )?
-        };
+        let (boxes, scores) = get_polygons_from_bitmap(
+            &pred.get(batch_index),
+            &segmentation.get(batch_index),
+            &adjust_values.get(batch_index),
+        )?;
         boxes_batch.push(boxes);
         scores_batch.push(scores);
     }
@@ -72,6 +61,7 @@ pub fn get_polygons_from_bitmap(
     let max_candidates = 1000;
     let box_thresh = 0.7;
     let save_pred_to_file = false;
+    let min_size = 5.;
 
     // convert bitmap to GrayImage
     let image = image_ops::convert_tensor_to_image(&(bitmap.get(0) * 255))?;
@@ -88,16 +78,15 @@ pub fn get_polygons_from_bitmap(
         .map(|c| c.points)
         .collect::<Vec<Vec<Point<u32>>>>();
     let num_contours = contours.len().min(max_candidates);
-    let mut boxes =
-        vec![Polygon::new(LineString::from(Vec::<(u32, u32)>::new()), vec![]); num_contours];
-    let mut scores = vec![0.; num_contours];
+    let mut boxes = Vec::with_capacity(num_contours);
+    let mut scores = Vec::with_capacity(num_contours);
 
-    for i in 0..num_contours {
-        let mut epsilon = 0.01 * arc_length(&contours[i], true);
+    for contour in &contours {
+        let mut epsilon = 0.01 * arc_length(&contour, true);
         if epsilon == 0. {
             epsilon = 0.01;
         }
-        let mut points = approx_poly_dp(&contours[i], epsilon, true);
+        let mut points = approx_poly_dp(&contour, epsilon, true);
         if points.len() > 1 && points[0] == points[points.len() - 1] {
             points.pop();
         }
@@ -109,17 +98,27 @@ pub fn get_polygons_from_bitmap(
         if box_thresh > score {
             continue;
         }
+        let expanded = expand_polygon(&points, 2.).unwrap();
+        let (_, sside) = get_min_area_bounding_box(&expanded);
+        if sside < min_size {
+            continue;
+        }
 
-        boxes[i].exterior_mut(|exterior| {
-            exterior.0 = points.iter().fold(Vec::new(), |mut acc, p| {
-                acc.push(Coordinate {
-                    x: (p.x as f64 / adjust_values.double_value(&[0])).round() as u32,
-                    y: (p.y as f64 / adjust_values.double_value(&[1])).round() as u32,
-                });
-                acc
-            })
-        });
-        scores[i] = score;
+        boxes.push(Polygon::new(
+            LineString::from(
+                expanded
+                    .iter()
+                    .map(|p| {
+                        (
+                            (p.x as f64 / adjust_values.double_value(&[0])).round() as u32,
+                            (p.y as f64 / adjust_values.double_value(&[1])).round() as u32,
+                        )
+                    })
+                    .collect::<Vec<(u32, u32)>>(),
+            ),
+            vec![],
+        ));
+        scores.push(score);
     }
 
     Ok((MultiPolygon::from(boxes), scores))
@@ -129,53 +128,10 @@ pub fn binarize(pred: &Tensor, thresh: f64) -> Result<Tensor> {
     Ok(pred.gt(thresh).to_kind(Kind::Uint8))
 }
 
-pub fn get_boxes_from_bitmap(
-    pred: &Tensor,
-    bitmap: &Tensor,
-    adjust_values: &Tensor,
-) -> Result<(MultiPolygon<u32>, Vec<f64>)> {
-    let max_candidates = 1000;
-    let min_size = 3.;
-    let box_thresh = 0.7;
-
-    // convert bitmap to GrayImage
-    let image = image_ops::convert_tensor_to_image(&(bitmap.get(0) * 255))?;
-
-    let contours = find_contours(&image)
-        .into_iter()
-        .map(|c| c.points)
-        .collect::<Vec<Vec<Point<u32>>>>();
-    let num_contours = contours.len().min(max_candidates);
-    let mut boxes =
-        vec![Polygon::new(LineString::from(Vec::<(u32, u32)>::new()), vec![]); num_contours];
-    let mut scores = vec![0.; num_contours];
-
-    for i in 0..num_contours {
-        let (points, sside) = get_min_area_bounding_box(&contours[i]);
-        if sside < min_size {
-            continue;
-        }
-        let score = box_score_fast(&pred.get(0), &points)?;
-        if box_thresh > score {
-            continue;
-        }
-
-        boxes[i].exterior_mut(|exterior| {
-            exterior.0 = points.iter().fold(Vec::new(), |mut acc, p| {
-                acc.push(Coordinate {
-                    x: (p.x as f64 / adjust_values.double_value(&[0])).round() as u32,
-                    y: (p.y as f64 / adjust_values.double_value(&[1])).round() as u32,
-                });
-                acc
-            })
-        });
-        scores[i] = score;
-    }
-
-    Ok((MultiPolygon::from(boxes), scores))
-}
-
-pub fn get_min_area_bounding_box(contour: &[Point<u32>]) -> (Vec<Point<u32>>, f64) {
+pub fn get_min_area_bounding_box<T>(contour: &[Point<T>]) -> (Vec<Point<T>>, f64)
+where
+    T: Num + NumCast + PartialEq + Eq + Copy + std::cmp::Ord,
+{
     let mut b_box = min_area_rect(contour);
     b_box.sort_by(|a, b| a.x.cmp(&b.x));
     let i1 = if b_box[1].y > b_box[0].y { 0 } else { 1 };
@@ -194,16 +150,14 @@ pub fn box_score_fast(bitmap: &Tensor, points: &[Point<u32>]) -> Result<f64> {
     let w = size[size.len() - 2] as u32;
     let h = size[size.len() - 1] as u32;
     let (mut min_x, mut max_x, mut min_y, mut max_y) =
-        points
-            .iter()
-            .fold((std::u32::MAX, 0, std::u32::MAX, 0), |acc, p| {
-                (
-                    acc.0.min(p.x),
-                    acc.1.max(p.x),
-                    acc.2.min(p.y),
-                    acc.3.max(p.y),
-                )
-            });
+        points.iter().fold((u32::MAX, 0, u32::MAX, 0), |acc, p| {
+            (
+                acc.0.min(p.x),
+                acc.1.max(p.x),
+                acc.2.min(p.y),
+                acc.3.max(p.y),
+            )
+        });
     min_x = clamp(min_x, 0, w - 1);
     max_x = clamp(max_x, 0, w - 1);
     min_y = clamp(min_y, 0, h - 1);
@@ -237,7 +191,6 @@ pub fn validate_measure(
     ignore_tags: &[Vec<bool>],
     pred: &[MultiPolygon<u32>],
     scores: &[Vec<f64>],
-    is_output_polygon: bool,
 ) -> Result<Vec<MetricsItem>> {
     let box_thresh = 0.6;
     let mut result = Vec::with_capacity(polygons.len());
@@ -249,7 +202,7 @@ pub fn validate_measure(
     ) {
         let mut pred_polygons = Vec::new();
         for (&score, pred) in curr_scores.iter().zip(curr_pred.0.iter()) {
-            if is_output_polygon || score >= box_thresh {
+            if score >= box_thresh {
                 pred_polygons.push(pred.clone());
             }
         }
@@ -443,7 +396,6 @@ mod tests {
     use super::image_ops::convert_image_to_tensor;
     use super::*;
     use image::open;
-    use imageproc::drawing::draw_polygon_mut;
 
     #[test]
     fn get_min_area_bounding_box_test() {
@@ -550,151 +502,8 @@ mod tests {
     }
 
     #[test]
-    fn get_boxes_from_bitmap_test_perfect_match_with_2x_adjustments() -> Result<()> {
-        let polygons_image = open("test_data/polygon.png")?.to_luma();
-        let h = polygons_image.height() as i64;
-        let w = polygons_image.width() as i64;
-        let bit_tensor = convert_image_to_tensor(&polygons_image)?;
-        let bitmap_tensor = (&bit_tensor / 255.).to_kind(Kind::Uint8).view((1, h, w));
-
-        // perfect match
-        let mut prediction_image = GrayImage::new(w as u32, h as u32);
-        draw_polygon_mut(
-            &mut prediction_image,
-            &[
-                Point::new(60, 16),
-                Point::new(141, 24),
-                Point::new(137, 61),
-                Point::new(57, 53),
-            ],
-            Luma::white(),
-        );
-        draw_polygon_mut(
-            &mut prediction_image,
-            &[
-                Point::new(235, 17),
-                Point::new(302, 21),
-                Point::new(299, 59),
-                Point::new(233, 54),
-            ],
-            Luma::white(),
-        );
-        draw_polygon_mut(
-            &mut prediction_image,
-            &[
-                Point::new(7, 75),
-                Point::new(148, 95),
-                Point::new(145, 111),
-                Point::new(4, 91),
-            ],
-            Luma::white(),
-        );
-        draw_polygon_mut(
-            &mut prediction_image,
-            &[
-                Point::new(250, 79),
-                Point::new(303, 85),
-                Point::new(299, 126),
-                Point::new(245, 120),
-            ],
-            Luma::white(),
-        );
-        draw_polygon_mut(
-            &mut prediction_image,
-            &[
-                Point::new(25, 181),
-                Point::new(125, 181),
-                Point::new(125, 268),
-                Point::new(25, 268),
-            ],
-            Luma::white(),
-        );
-        draw_polygon_mut(
-            &mut prediction_image,
-            &[
-                Point::new(190, 250),
-                Point::new(255, 185),
-                Point::new(285, 215),
-                Point::new(220, 280),
-            ],
-            Luma::white(),
-        );
-        let pred_tensor = (convert_image_to_tensor(&prediction_image)? / 255.).view((1, h, w));
-
-        // 2x adjustment
-        let adjust_values = Tensor::of_slice(&[2., 2.]);
-        let expected_boxes = MultiPolygon::from(vec![
-            // expected boxes are reajdusted to the original image size (divided by adjust values)
-            Polygon::new(
-                LineString::from(vec![(30, 8), (71, 12), (69, 31), (29, 27)]),
-                vec![],
-            ), // 1
-            Polygon::new(
-                LineString::from(vec![(118, 9), (151, 11), (150, 30), (117, 27)]),
-                vec![],
-            ), // 2
-            Polygon::new(
-                LineString::from(vec![(4, 38), (74, 48), (73, 56), (2, 46)]),
-                vec![],
-            ), // 3
-            Polygon::new(
-                LineString::from(vec![(125, 40), (152, 43), (150, 63), (123, 60)]),
-                vec![],
-            ), // 4
-            Polygon::new(
-                LineString::from(vec![(13, 91), (63, 91), (63, 134), (13, 134)]),
-                vec![],
-            ), // 5
-            Polygon::new(
-                LineString::from(vec![(95, 125), (128, 93), (143, 108), (110, 140)]),
-                vec![],
-            ), // 6
-        ]);
-        let expected_scores = vec![1.; 6];
-        assert_eq!(
-            get_boxes_from_bitmap(&pred_tensor, &bitmap_tensor, &adjust_values)?,
-            (expected_boxes, expected_scores)
-        );
-        Ok(())
-    }
-
-    #[test]
-    fn get_boxes_from_bitmap_test_partial_match_without_adjustments() -> Result<()> {
-        let polygons_image = open("test_data/polygon.png")?.to_luma();
-        let h = polygons_image.height() as i64;
-        let w = polygons_image.width() as i64;
-        let bit_tensor = convert_image_to_tensor(&polygons_image)?;
-        let bitmap_tensor = (&bit_tensor / 255.).to_kind(Kind::Uint8).view((1, h, w));
-
-        let pred_tensor = (convert_image_to_tensor(&polygons_image)? / 255.).view((1, h, w));
-        // no adjustment
-        let adjust_values = Tensor::of_slice(&[1., 1.]);
-        let expected_boxes = MultiPolygon::from(vec![
-            // expected boxes with score over thresh (0.7) should appear
-            Polygon::new(LineString::from(Vec::<(u32, u32)>::new()), vec![]), // 1
-            Polygon::new(LineString::from(Vec::<(u32, u32)>::new()), vec![]), // 2
-            Polygon::new(LineString::from(Vec::<(u32, u32)>::new()), vec![]), // 3
-            Polygon::new(
-                LineString::from(vec![(250, 79), (303, 85), (299, 126), (245, 120)]),
-                vec![],
-            ), // 4
-            Polygon::new(
-                LineString::from(vec![(25, 181), (125, 181), (125, 268), (25, 268)]),
-                vec![],
-            ), // 5
-            Polygon::new(LineString::from(Vec::<(u32, u32)>::new()), vec![]), // 6
-        ]);
-        let expected_scores = vec![0., 0., 0., 0.703405017921147, 0.7521377137713772, 0.];
-        assert_eq!(
-            get_boxes_from_bitmap(&pred_tensor, &bitmap_tensor, &adjust_values)?,
-            (expected_boxes, expected_scores)
-        );
-        Ok(())
-    }
-
-    #[test]
     fn get_polygons_from_bitmap_test_without_adjustments() -> Result<()> {
-        let polygons_image = open("test_data/polygon.png")?.to_luma();
+        let polygons_image = open("test_data/gt_shrinked_img55.png")?.to_luma();
         let h = polygons_image.height() as i64;
         let w = polygons_image.width() as i64;
         let bit_tensor = convert_image_to_tensor(&polygons_image)?;
@@ -704,72 +513,58 @@ mod tests {
         // no adjustment
         let adjust_values = Tensor::of_slice(&[1., 1.]);
         let expected_boxes = MultiPolygon(vec![
+            // 1
             Polygon::new(
                 LineString::from(vec![
-                    (100, 20),
-                    (90, 35),
-                    (60, 25),
-                    (90, 40),
-                    (80, 55),
-                    (101, 50),
-                    (130, 60),
-                    (115, 45),
-                    (140, 30),
-                    (120, 35),
+                    (562, 75),
+                    (559, 108),
+                    (532, 108),
+                    (427, 105),
+                    (435, 68),
                 ]),
                 vec![],
-            ), // 1
+            ),
+            // 2
             Polygon::new(
                 LineString::from(vec![
-                    (275, 20),
-                    (265, 35),
-                    (235, 25),
-                    (265, 40),
-                    (255, 55),
-                    (276, 50),
-                    (299, 58),
-                    (299, 54),
-                    (290, 45),
-                    (299, 40),
-                    (299, 34),
-                    (295, 35),
+                    (547, 178),
+                    (515, 255),
+                    (404, 212),
+                    (287, 226),
+                    (263, 160),
+                    (407, 125),
                 ]),
                 vec![],
-            ), // 2
-            Polygon::new(LineString::from(Vec::<(u32, u32)>::new()), vec![]), // 3, it is ignored since its a triangle
+            ),
+            // 3
             Polygon::new(
                 LineString::from(vec![
-                    (250, 80),
-                    (250, 120),
-                    (296, 125),
-                    (299, 125),
-                    (299, 104),
+                    (448, 245),
+                    (450, 301),
+                    (427, 301),
+                    (345, 292),
+                    (332, 233),
                 ]),
                 vec![],
-            ), // 4
+            ),
+            // 4
             Polygon::new(
                 LineString::from(vec![
-                    (50, 181),
-                    (25, 225),
-                    (49, 268),
-                    (100, 268),
-                    (125, 225),
-                    (100, 181),
+                    (400, 322),
+                    (534, 303),
+                    (550, 361),
+                    (401, 385),
+                    (263, 319),
+                    (278, 271),
                 ]),
                 vec![],
-            ), // 5
-            Polygon::new(
-                LineString::from(vec![(269, 200), (240, 210), (190, 250), (220, 280)]),
-                vec![],
-            ), // 6
+            ),
         ]);
         let expected_scores = vec![
-            1.0,
-            0.9980139026812314,
-            0.0,
-            0.9924146649810367,
-            1.0,
-            0.9978822532825075,
+            0.9819034852546917,
+            0.9938022931515339,
+            0.9911894273127754,
+            0.9923459624952162,
         ];
         assert_eq!(
             get_polygons_from_bitmap(&pred_tensor, &bitmap_tensor, &adjust_values)?,
@@ -780,7 +575,7 @@ mod tests {
 
     #[test]
     fn get_polygons_from_bitmap_test_with_2x_adjustments() -> Result<()> {
-        let polygons_image = open("test_data/polygon.png")?.to_luma();
+        let polygons_image = open("test_data/gt_shrinked_img55.png")?.to_luma();
         let h = polygons_image.height() as i64;
         let w = polygons_image.width() as i64;
         let bit_tensor = convert_image_to_tensor(&polygons_image)?;
@@ -790,66 +585,52 @@ mod tests {
         // resized by w x 2, h x 2
         let adjust_values = Tensor::of_slice(&[2., 2.]);
         let expected_boxes = MultiPolygon::from(vec![
+            // 1
+            Polygon::new(
+                LineString::from(vec![(281, 38), (280, 54), (266, 54), (214, 53), (218, 34)]),
+                vec![],
+            ),
+            // 2
             Polygon::new(
                 LineString::from(vec![
-                    (50, 10),
-                    (45, 18),
-                    (30, 13),
-                    (45, 20),
-                    (40, 28),
-                    (51, 25),
-                    (65, 30),
-                    (58, 23),
-                    (70, 15),
-                    (60, 18),
+                    (274, 89),
+                    (258, 128),
+                    (202, 106),
+                    (144, 113),
+                    (132, 80),
+                    (204, 63),
                 ]),
                 vec![],
-            ), // 1
+            ),
+            // 3
             Polygon::new(
                 LineString::from(vec![
-                    (138, 10),
-                    (133, 18),
-                    (118, 13),
-                    (133, 20),
-                    (128, 28),
-                    (138, 25),
-                    (150, 29),
-                    (150, 27),
-                    (145, 23),
-                    (150, 20),
-                    (150, 17),
-                    (148, 18),
+                    (224, 123),
+                    (225, 151),
+                    (214, 151),
+                    (173, 146),
+                    (166, 117),
                 ]),
                 vec![],
-            ), // 2
-            Polygon::new(LineString::from(Vec::<(u32, u32)>::new()), vec![]), // 3, it is ignored since its a triangle
-            Polygon::new(
-                LineString::from(vec![(125, 40), (125, 60), (148, 63), (150, 63), (150, 52)]),
-                vec![],
-            ), // 4
+            ),
+            // 4
             Polygon::new(
                 LineString::from(vec![
-                    (25, 91),
-                    (13, 113),
-                    (25, 134),
-                    (50, 134),
-                    (63, 113),
-                    (50, 91),
+                    (200, 161),
+                    (267, 152),
+                    (275, 181),
+                    (201, 193),
+                    (132, 160),
+                    (139, 136),
                 ]),
                 vec![],
-            ), // 5
-            Polygon::new(
-                LineString::from(vec![(135, 100), (120, 105), (95, 125), (110, 140)]),
-                vec![],
-            ), // 6
+            ),
         ]);
         let expected_scores = vec![
-            1.0,
-            0.9980139026812314,
-            0.0,
-            0.9924146649810367,
-            1.0,
-            0.9978822532825075,
+            0.9819034852546917,
+            0.9938022931515339,
+            0.9911894273127754,
+            0.9923459624952162,
         ];
         assert_eq!(
             get_polygons_from_bitmap(&pred_tensor, &bitmap_tensor, &adjust_values)?,
@@ -861,14 +642,16 @@ mod tests {
     #[test]
     fn evaluate_image_test_one_matching_polygon() -> Result<()> {
         let gt_polygons_tensor = MultiPolygon::from(vec![
+            // poly 1
             Polygon::new(
                 LineString::from(vec![(0, 0), (10, 0), (10, 10), (0, 10)]),
                 vec![],
-            ), // poly 1
+            ),
+            // poly 2
             Polygon::new(
                 LineString::from(vec![(20, 20), (30, 20), (30, 30), (20, 30)]),
                 vec![],
-            ), // poly 2
+            ),
         ]);
         let ignore_polygons = [false, false];
         let pred = MultiPolygon::from(vec![Polygon::new(
@@ -890,10 +673,12 @@ mod tests {
     #[test]
     fn evaluate_image_test_with_ignored_polygons() -> Result<()> {
         let gt_polygons_tensor = MultiPolygon::from(vec![
+            // poly 1
             Polygon::new(
                 LineString::from(vec![(0, 0), (10, 0), (10, 10), (0, 10)]),
                 vec![],
-            ), // poly 1
+            ),
+            // poly 2
             Polygon::new(
                 LineString::from(vec![(20, 20), (30, 20), (30, 30), (20, 30)]),
                 vec![],
@@ -919,10 +704,12 @@ mod tests {
     #[test]
     fn evaluate_image_test_with_both_matched_polygons() -> Result<()> {
         let gt_polygons_tensor = MultiPolygon::from(vec![
+            // poly 1
             Polygon::new(
                 LineString::from(vec![(0, 0), (10, 0), (10, 10), (0, 10)]),
                 vec![],
             ),
+            // poly 2
             Polygon::new(
                 LineString::from(vec![(20, 20), (30, 20), (30, 30), (20, 30)]),
                 vec![],
@@ -956,25 +743,29 @@ mod tests {
         let gt_polygons_tensor = vec![
             // image 1
             MultiPolygon::from(vec![
+                // poly 1
                 Polygon::new(
                     LineString::from(vec![(0, 0), (10, 0), (10, 10), (0, 10)]),
                     vec![],
-                ), // poly 1
+                ),
+                // poly 2
                 Polygon::new(
                     LineString::from(vec![(20, 20), (30, 20), (30, 30), (20, 30)]),
                     vec![],
-                ), // poly 2
+                ),
             ]),
             // image 2
             MultiPolygon::from(vec![
+                // poly 1
                 Polygon::new(
                     LineString::from(vec![(0, 0), (10, 0), (10, 10), (0, 10)]),
                     vec![],
-                ), // poly 1
+                ),
+                // poly 2
                 Polygon::new(
                     LineString::from(vec![(20, 20), (30, 20), (30, 30), (20, 30)]),
                     vec![],
-                ), // poly 2
+                ),
             ]),
         ];
         let ignore_polygons = [
@@ -992,8 +783,7 @@ mod tests {
             )]),
         ];
         let scores = [vec![0.9], vec![0.9]];
-        let metrics =
-            validate_measure(&gt_polygons_tensor, &ignore_polygons, &pred, &scores, true)?;
+        let metrics = validate_measure(&gt_polygons_tensor, &ignore_polygons, &pred, &scores)?;
         assert_eq!(metrics.len(), 2);
 
         // image 1 metrics (having 1 matched polygon)

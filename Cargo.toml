@@ -22,7 +22,8 @@ regex = "1.4.2"
 log4rs = "0.13.0"
 log = "0.4.11"
 image = "0.23.11"
-imageproc = { git = "https://github.com/image-rs/imageproc" }
+# imageproc = { git = "https://github.com/image-rs/imageproc" }
+imageproc = { git = "https://github.com/lazareviczoran/imageproc", branch = "zl-fix-convex-hull-limit" }
 rayon = "1.5.0"
 clap = "2.33.3"
 geo = { version = "0.15.0", features = ["use-serde"] }

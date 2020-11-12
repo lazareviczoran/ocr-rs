@@ -625,7 +625,7 @@ dependencies = [
 [[package]]
 name = "imageproc"
 version = "0.21.0"
-source = "git+https://github.com/image-rs/imageproc#973937f63ff737cf2618a8c8ff8d7692314abe9f"
+source = "git+https://github.com/lazareviczoran/imageproc?branch=zl-fix-convex-hull-limit#5dc3f222ab695e9ec0a0ae765e7c552ebe8be27d"
 dependencies = [
  "conv",
  "image",

@@ -10,6 +10,7 @@ mod dataset;
 mod image_ops;
 #[macro_use]
 mod macros;
+mod polygon;
 mod text_detection;
 mod utils;
 
