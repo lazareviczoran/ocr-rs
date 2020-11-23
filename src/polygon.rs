@@ -1,7 +1,7 @@
 use geo::prelude::*;
 use geo::{CoordinateType, LineString, Polygon};
 use geo_clipper::{Clipper, EndType, JoinType};
-use imageproc::definitions::Point;
+use imageproc::point::Point;
 use num_traits::{Num, NumCast};
 
 #[derive(PartialEq, Eq)]

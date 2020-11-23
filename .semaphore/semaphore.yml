@@ -3,22 +3,47 @@ name: ocr-rs CI pipeline
 agent:
   machine:
     type: e1-standard-2
+    os_image: ubuntu1804
 
-  containers:
-    - name: main
-      image: 'lazareviczoran/ocr-rs:0.0.3'
+auto_cancel:
+  running:
+    when: "true"
 
 blocks:
+  - name: 'Prepare docker image'
+    task:
+      jobs:
+        - name: 'Prepare docker image'
+          commands:
+            - checkout
+            - ./.semaphore/scripts/prepare-docker-image.sh
+      secrets:
+        - name: docker-hub
+
   - name: 'Build'
     task:
       jobs:
         - name: 'Build'
           commands:
             - checkout
-            - cargo build -v
+            - cache restore $SEMAPHORE_GIT_BRANCH-image-tag
+            - export TAG=$(cat image-tag.txt)
+            - echo $DOCKER_HUB_ACCESS_TOKEN | docker login --username $DOCKER_USERNAME --password-stdin
+            - docker pull lazareviczoran/ocr-rs:$TAG
+            - docker run -it lazareviczoran/ocr-rs:$TAG cargo build -v
+      secrets:
+        - name: docker-hub
 
   - name: 'fmt'
     task:
+      agent:
+        machine:
+          type: e1-standard-2
+
+        containers:
+          - name: main
+            image: 'rust:latest'
+
       jobs:
         - name: 'fmt'
           commands:
@@ -28,10 +53,26 @@ blocks:
 
   - name: 'Tests'
     task:
-      prologue:
-        commands:
-          - checkout
       jobs:
-        - name: 'Unit tests'
+        - name: 'tests'
           commands:
-            - cargo test -v
+            - checkout
+            - cache restore $SEMAPHORE_GIT_BRANCH-image-tag
+            - export TAG=$(cat image-tag.txt)
+            - echo $DOCKER_HUB_ACCESS_TOKEN | docker login --username $DOCKER_USERNAME --password-stdin
+            - docker pull lazareviczoran/ocr-rs:$TAG
+            - docker run -it -v "$(pwd)":/app lazareviczoran/ocr-rs:$TAG cargo test -v
+      secrets:
+        - name: docker-hub
+
+  - name: 'Update latest docker image'
+    run:
+      when: "change_in('./Dockerfile')"
+    task:
+      jobs:
+        - name: 'Update latest docker image'
+          commands:
+            - checkout
+            - ./.semaphore/scripts/update-latest-docker-image.sh
+      secrets:
+        - name: docker-hub

@@ -2,12 +2,14 @@ use crate::image_ops;
 use crate::polygon::expand_polygon;
 use anyhow::Result;
 use geo::prelude::*;
-use geo::{LineString, MultiPolygon, Polygon};
+use geo::{Line, LineString, MultiPolygon, Polygon};
 use geo_clipper::Clipper;
 use image::{GrayImage, Luma};
-use imageproc::contours::{approx_poly_dp, arc_length, find_contours, get_distance, min_area_rect};
-use imageproc::definitions::{HasWhite, Point};
-use imageproc::drawing::{self};
+use imageproc::contours::find_contours;
+use imageproc::definitions::HasWhite;
+use imageproc::drawing::draw_polygon_mut;
+use imageproc::geometry::{approximate_polygon_dp, arc_length, min_area_rect};
+use imageproc::point::Point;
 use itertools::izip;
 use num_traits::{clamp, Num, NumCast};
 use std::sync::Mutex;
@@ -86,7 +88,7 @@ pub fn get_polygons_from_bitmap(
         if epsilon == 0. {
             epsilon = 0.01;
         }
-        let mut points = approx_poly_dp(&contour, epsilon, true);
+        let mut points = approximate_polygon_dp(&contour, epsilon, true);
         if points.len() > 1 && points[0] == points[points.len() - 1] {
             points.pop();
         }
@@ -140,8 +142,8 @@ where
     let i4 = if b_box[1].y > b_box[0].y { 1 } else { 0 };
 
     let res = vec![b_box[i1], b_box[i2], b_box[i3], b_box[i4]];
-    let w = get_distance(&res[0], &res[1]);
-    let h = get_distance(&res[0], &res[3]);
+    let w = Line::new(to_f64_tuple(res[0]), to_f64_tuple(res[1])).euclidean_length();
+    let h = Line::new(to_f64_tuple(res[0]), to_f64_tuple(res[3])).euclidean_length();
     (res, w.min(h))
 }
 
@@ -167,7 +169,7 @@ pub fn box_score_fast(bitmap: &Tensor, points: &[Point<u32>]) -> Result<f64> {
         .iter()
         .map(|p| Point::new((p.x - min_x) as i32, (p.y - min_y) as i32))
         .collect();
-    drawing::draw_polygon_mut(&mut mask_image, &moved_points, Luma::white());
+    draw_polygon_mut(&mut mask_image, &moved_points, Luma::white());
 
     let mask = (image_ops::convert_image_to_tensor(&mask_image)? / 255).to_kind(Kind::Uint8);
 
@@ -389,6 +391,10 @@ fn get_union(poly1: &Polygon<f64>, poly2: &Polygon<f64>) -> Result<f64> {
 
 fn get_intersection_over_union(poly1: &Polygon<f64>, poly2: &Polygon<f64>) -> Result<f64> {
     Ok(get_intersection(poly1, poly2)? / get_union(poly1, poly2)?)
+}
+
+fn to_f64_tuple<T: NumCast>(p: Point<T>) -> (f64, f64) {
+    (p.x.to_f64().unwrap(), p.y.to_f64().unwrap())
 }
 
 #[cfg(test)]

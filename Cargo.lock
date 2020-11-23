@@ -624,8 +624,9 @@ dependencies = [
 
 [[package]]
 name = "imageproc"
-version = "0.21.0"
-source = "git+https://github.com/lazareviczoran/imageproc?branch=zl-fix-convex-hull-limit#5dc3f222ab695e9ec0a0ae765e7c552ebe8be27d"
+version = "0.22.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7923654f3ce7cb6849d5dc9e544aaeab49c508a90b56c721b046e7234c74ab53"
 dependencies = [
  "conv",
  "image",
@@ -1404,9 +1405,9 @@ dependencies = [
 
 [[package]]
 name = "tch"
-version = "0.2.1"
+version = "0.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "57756d8b38ed254fbb9ed7cf47fdd0eb93ffe4d1aa927fd5ffa6b019d0fa4efd"
+checksum = "2b4b011115a312db130e804d41329e4d13a199d3b7ce66cc3971713afb22382a"
 dependencies = [
  "half",
  "lazy_static",
@@ -1500,9 +1501,9 @@ dependencies = [
 
 [[package]]
 name = "torch-sys"
-version = "0.2.1"
+version = "0.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "69bad0036396fded468d8f6ea3105b99282dbb65d5da498f65c65e0816738417"
+checksum = "bef4f8aea151542d5321ac378fd718a87521adb8bc026eb5b2697106503f362c"
 dependencies = [
  "cc",
  "cmake",

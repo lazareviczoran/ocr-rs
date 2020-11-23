@@ -1,30 +1,32 @@
 FROM rust:stretch
 
 # The image built from this dockerfile is used to run the OCR on any machine with docker.
+# Includes some profiling tools.
 
 # Install basic tools
 RUN apt-get -y update \
-    && apt-get -y install build-essential \
-                          openssl \
-                          libssl1.1 \
-                          libssl-dev \
-                          git \
-                          make \
-                          gcc \
-                          pkg-config \
-                          autoconf \
-                          clang-7 \
-                          llvm-7 \
-                          llvm-7-dev \
-                          linux-tools \
-                          linux-perf \
-                          linux-perf-4.19 \
-    && ldconfig /usr/local/lib \
-    && cargo install flamegraph;
+  && apt-get -y install build-essential \
+  openssl \
+  libssl1.1 \
+  libssl-dev \
+  git \
+  make \
+  gcc \
+  pkg-config \
+  autoconf \
+  clang-7 \
+  llvm-7 \
+  llvm-7-dev \
+  linux-tools \
+  linux-perf \
+  linux-perf-4.19 \
+  && ldconfig /usr/local/lib \
+  && cargo install flamegraph;
 
 # Install pytorch dependencies
-RUN wget https://download.pytorch.org/libtorch/cpu/libtorch-cxx11-abi-shared-with-deps-1.6.0%2Bcpu.zip \
-  && unzip libtorch-cxx11-abi-shared-with-deps-1.6.0+cpu.zip -d /usr/lib/;
+RUN wget https://download.pytorch.org/libtorch/cpu/libtorch-cxx11-abi-shared-with-deps-1.7.0%2Bcpu.zip \
+  && unzip libtorch-cxx11-abi-shared-with-deps-1.7.0+cpu.zip -d /usr/lib/ \
+  && rm libtorch-cxx11-abi-shared-with-deps-1.7.0.zip;
 
 ENV LIBTORCH=/usr/lib/libtorch
 ENV LD_LIBRARY_PATH=${LIBTORCH}/lib:$LD_LIBRARY_PATH

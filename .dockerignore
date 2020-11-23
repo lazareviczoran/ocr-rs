@@ -12,7 +12,12 @@ training_images_data
 training_labels_data
 /log/*
 **/*.model
-test_data
+test_data/
+.git/
+training_images_data_char_rec
+training_labels_data_char_rec
+test_images_data_char_rec
+test_labels_data_char_rec
 
 # profiling output
 perf.data
