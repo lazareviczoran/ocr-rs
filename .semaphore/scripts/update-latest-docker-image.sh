@@ -1,13 +1,14 @@
 set -e
 REPO="lazareviczoran/ocr-rs"
 
-if [[ ( "$SEMAPHORE_GIT_BRANCH" == "master" ) \
-        && ( -z "$(git diff $SEMAPHORE_GIT_COMMIT_RANGE --name-only|grep Dockerfile)" ) ]]; then
-    echo 'Preparing to push to docker hub'
+# Load tag name from semaphore cache
+cache restore $SEMAPHORE_GIT_BRANCH-image-tag
+TAG=$(cat image-tag.txt)
 
-    # Load tag name from semaphore cache
-    cache restore $SEMAPHORE_GIT_BRANCH-image-tag
-    TAG=$(cat image-tag.txt)
+
+if [[ ( "$SEMAPHORE_GIT_BRANCH" == "master" ) \
+        && ( -n "$(git diff $SEMAPHORE_GIT_COMMIT_RANGE --name-only|grep Dockerfile)" ) ]]; then
+    echo 'Preparing to push to docker hub'
 
     # install required libs
     apt-get install jq -y
@@ -33,4 +34,22 @@ if [[ ( "$SEMAPHORE_GIT_BRANCH" == "master" ) \
     echo 'Successfully uploaded new image version'
 else
     echo 'Not on main branch (master), skipping push'
+fi
+
+# Cleanup if necessary
+login_data() {
+cat <<EOF
+{
+"username": "$DOCKER_USERNAME",
+"password": "$DOCKER_HUB_PASSWORD"
+}
+EOF
+}
+if [[ "$TAG" != "latest" ]]; then
+    # Cannot use access token for this action https://github.com/docker/roadmap/issues/115
+    URL=https://hub.docker.com/v2/users/login/
+    DATA='{ "username": "$DOCKER_USERNAME","password": "$DOCKER_HUB_PASSWORD" }'
+    TOKEN=$(curl -s -H "Content-Type: application/json" -X POST -d "$(login_data)" $URL | jq -r .token)
+    curl -H "Authorization: JWT ${TOKEN}" -X "DELETE" \
+        https://hub.docker.com/v2/repositories/$REPO/tags/$TAG/
 fi

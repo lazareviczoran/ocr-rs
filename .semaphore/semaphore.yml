@@ -66,8 +66,6 @@ blocks:
         - name: docker-hub
 
   - name: 'Update latest docker image'
-    run:
-      when: "change_in('./Dockerfile')"
     task:
       jobs:
         - name: 'Update latest docker image'

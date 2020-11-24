@@ -1,6 +1,5 @@
-FROM rust:buster
-
 # The image built from this dockerfile is used to run the OCR on any machine with docker.
+FROM rust:buster
 
 RUN apt-get -y update \
   # Install basic tools
