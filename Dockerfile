@@ -2,7 +2,7 @@
 FROM rust:buster
 
 RUN apt-get -y update \
-  # Install basic tools
+  # Install tools
   && apt-get -y install openssl clang-7 \
   # Install pytorch dependencies
   && wget https://download.pytorch.org/libtorch/cu102/libtorch-cxx11-abi-shared-with-deps-1.7.0.zip \
