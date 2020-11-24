@@ -10,18 +10,18 @@ if [[ ( "$SEMAPHORE_GIT_BRANCH" == "master" ) \
         && ( -n "$(git diff $SEMAPHORE_GIT_COMMIT_RANGE --name-only|grep Dockerfile)" ) ]]; then
     echo 'Preparing to push to docker hub'
 
-    # install required libs
-    sudo apt-get install jq -y
-
     # Fetch existing tags, and use latest that matches pattern (e.g. 0.0.1) if exists
     URL=https://registry.hub.docker.com/v2/repositories/$REPO/tags?ordering=last_updated
-    LATEST_VERSION=$(curl $URL | jq '."results"[]["name"]' | grep -E -m 1 '\d+\.\d+\.\d+')
+    LATEST_VERSION=$(curl $URL | jq '."results"[]["name"]' | grep -Po '"\d+\.\d+\.\d+"' -m 1)
     if [ -z $LATEST_VERSION ]; then
         LATEST_VERSION="0.0.1"
     fi
-    VALUES=($(echo $LATEST_VERSION|grep -Eo '\d+'))
-    VALUES[3]=$((VALUES[3] + 1))
+    echo "LATEST VERSION $LATEST_VERSION"
+    VALUES=($(echo $LATEST_VERSION|grep -Po '\d+'))
+    VALUES[2]=$((VALUES[2] + 1))
+    function join { local IFS="$1"; shift; echo "$*"; }
     NEW_VERSION=$(join . ${VALUES[@]})
+    echo "NEW_VERSION $NEW_VERSION"
 
     echo $DOCKER_HUB_ACCESS_TOKEN | docker login --username $DOCKER_USERNAME --password-stdin
     docker pull $REPO:$TAG
