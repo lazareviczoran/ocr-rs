@@ -14,7 +14,7 @@ if [[ ( "$SEMAPHORE_GIT_BRANCH" == "master" ) \
     sudo apt-get install jq -y
 
     # Fetch existing tags, and use latest that matches pattern (e.g. 0.0.1) if exists
-    URL=https://registry.hub.docker.com/v2/repositories/$($REPO)/tags?ordering=last_updated
+    URL=https://registry.hub.docker.com/v2/repositories/$REPO/tags?ordering=last_updated
     LATEST_VERSION=$(curl $URL | jq '."results"[]["name"]' | grep -E -m 1 '\d+\.\d+\.\d+')
     if [ -z $LATEST_VERSION ]; then
         LATEST_VERSION="0.0.1"

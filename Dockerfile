@@ -6,7 +6,7 @@ RUN apt-get -y update && apt-get -y install openssl clang-7 \
   # Install pytorch dependencies
   && wget https://download.pytorch.org/libtorch/cu102/libtorch-cxx11-abi-shared-with-deps-1.7.0.zip \
   && unzip libtorch-cxx11-abi-shared-with-deps-1.7.0.zip -d /usr/lib/ \
-  # Cleanup unnecessary stuff
+  # remove unnecessary stuff
   && rm libtorch-cxx11-abi-shared-with-deps-1.7.0.zip;
 
 ENV LIBTORCH=/usr/lib/libtorch
